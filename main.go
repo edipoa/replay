@@ -33,9 +33,10 @@ type appConfig struct {
 	SegmentTime int
 
 	// Delivery
-	BotToken   string // required: REPLAY_BOT_TOKEN
-	ChatID     string // required: REPLAY_CHAT_ID
-	AgendaPath string
+	BotToken       string // required: REPLAY_BOT_TOKEN
+	ChatID         string // required: REPLAY_CHAT_ID
+	AgendaPath     string
+	TelegramLogPath string
 
 	// Hardware
 	GPIOPin    string // BCM pin name, e.g. "GPIO17"
@@ -52,7 +53,8 @@ func loadConfig() (appConfig, error) {
 		BufferDir:   envOr("REPLAY_BUFFER_DIR", "/tmp/replay_buffer"),
 		OutputDir:   envOr("REPLAY_OUTPUT_DIR", "/tmp/replays"),
 		SegmentTime: envIntOr("REPLAY_SEGMENT_TIME_S", 2),
-		AgendaPath:  envOr("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
+		AgendaPath:      envOr("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
+		TelegramLogPath: envOr("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
 		GPIOPin:     envOr("REPLAY_GPIO_PIN", "GPIO17"),
 		DebounceMs:  envIntOr("REPLAY_DEBOUNCE_MS", 2000),
 		Simulate:    simulate,
@@ -126,11 +128,21 @@ func run(logger *slog.Logger) error {
 	}
 
 	// ── 4. Delivery bot ───────────────────────────────────────────────────────
+	telegramLogFile, err := os.OpenFile(cfg.TelegramLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open telegram log %q: %w", cfg.TelegramLogPath, err)
+	}
+	defer telegramLogFile.Close()
+
+	telegramLogger := slog.New(slog.NewJSONHandler(telegramLogFile, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
 	bot, err := delivery.New(delivery.Config{
 		BotToken:   cfg.BotToken,
 		ChatID:     cfg.ChatID,
 		AgendaPath: cfg.AgendaPath,
-	}, logger)
+	}, telegramLogger)
 	if err != nil {
 		return fmt.Errorf("delivery bot: %w", err)
 	}
