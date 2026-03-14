@@ -199,6 +199,9 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 		"-loglevel", "warning",
 		"-f", "concat",
 		"-safe", "0", // Allow absolute paths in the concat file.
+		// Regenerate PTS from scratch — prevents truncation caused by
+		// non-monotonic DTS carried over from ingestion segments.
+		"-fflags", "+genpts",
 		"-i", concatPath,
 		// Re-encode video: CRF 28 + veryfast preset keeps CPU usage low on
 		// the Pi while producing files well under Telegram's 50 MB limit.
