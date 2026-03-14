@@ -80,13 +80,16 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 	args := []string{
 		"-loglevel", "warning",
 		"-rtsp_transport", "tcp",
-		// Use the system wall clock for all timestamps instead of the camera's
-		// broken PTS/DTS. This fixes irregular segment durations caused by
-		// cameras that reset audio timestamps mid-stream.
-		"-use_wallclock_as_timestamps", "1",
+		// Regenerate PTS/DTS from scratch to avoid non-monotonic timestamp
+		// warnings from cameras with broken firmware.
+		"-fflags", "+genpts",
 		"-i", e.cfg.RTSPUrl,
-		// Copy streams without re-encoding for minimal CPU usage.
-		"-c", "copy",
+		// Drop audio — the camera's audio stream resets DTS every ~116ms,
+		// producing non-monotonic timestamps that corrupt segment durations
+		// and cause the concat pass to produce incorrect output lengths.
+		"-an",
+		// Copy video stream without re-encoding for minimal CPU usage.
+		"-c:v", "copy",
 		// Segment muxer: one file per SegmentTime seconds.
 		"-f", "segment",
 		"-segment_time", strconv.Itoa(e.cfg.SegmentTime),

@@ -206,8 +206,9 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 		// Re-encode video: CRF 28 + veryfast preset keeps CPU usage low on
 		// the Pi while producing files well under Telegram's 50 MB limit.
 		"-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
-		// Re-encode audio to AAC for broad compatibility.
-		"-c:a", "aac", "-b:a", "128k",
+		// No audio — the camera's audio stream has broken DTS and was dropped
+		// during ingestion to prevent segment corruption.
+		"-an",
 		"-movflags", "+faststart", // Move MOOV atom to the front for streaming.
 		"-y",        // Overwrite output without asking.
 		outputPath,
