@@ -19,11 +19,11 @@ import (
 var weekdaysPT = [7]string{
 	"Domingo", // 0 – Sunday
 	"Segunda", // 1 – Monday
-	"Terça",   // 2 – Tuesday
+	"Terca",   // 2 – Tuesday
 	"Quarta",  // 3 – Wednesday
 	"Quinta",  // 4 – Thursday
 	"Sexta",   // 5 – Friday
-	"Sábado",  // 6 – Saturday
+	"Sabado",  // 6 – Saturday
 }
 
 func weekdayPT(d time.Weekday) string { return weekdaysPT[d] }
