@@ -212,7 +212,10 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	pass2 := []string{
 		"-loglevel", "warning",
 		"-i", tempPath,
-		"-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
+		// Scale to 720p max — reduces encode time significantly on edge devices.
+	// ultrafast preset trades compression ratio for CPU speed.
+	"-vf", "scale=1280:-2",
+	"-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",
 		"-c:a", "aac", "-b:a", "128k",
 		"-movflags", "+faststart",
 		"-y",
