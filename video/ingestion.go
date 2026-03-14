@@ -80,16 +80,12 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 	args := []string{
 		"-loglevel", "warning",
 		"-rtsp_transport", "tcp",
-		// Regenerate PTS/DTS from scratch to avoid non-monotonic timestamp
-		// warnings from cameras with broken firmware.
+		// Regenerate PTS/DTS from scratch — fixes "Non-monotonic DTS" warnings
+		// that appear when the camera firmware produces irregular timestamps.
 		"-fflags", "+genpts",
 		"-i", e.cfg.RTSPUrl,
-		// Drop audio — the camera's audio stream resets DTS every ~116ms,
-		// producing non-monotonic timestamps that corrupt segment durations
-		// and cause the concat pass to produce incorrect output lengths.
-		"-an",
-		// Copy video stream without re-encoding for minimal CPU usage.
-		"-c:v", "copy",
+		// Copy streams without re-encoding for minimal CPU usage.
+		"-c", "copy",
 		// Segment muxer: one file per SegmentTime seconds.
 		"-f", "segment",
 		"-segment_time", strconv.Itoa(e.cfg.SegmentTime),

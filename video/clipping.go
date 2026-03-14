@@ -184,42 +184,43 @@ func writeConcatFile(path string, segments []string) error {
 	return w.Flush()
 }
 
-// runFFmpegConcat runs:
+// runFFmpegConcat concatenates segments into a final MP4 in two passes:
 //
-//	ffmpeg -f concat -safe 0 -i <concatPath> \
-//	       -c:v libx264 -crf 28 -preset veryfast \
-//	       -c:a aac -b:a 128k \
-//	       -movflags +faststart <outputPath>
-//
-// Re-encodes to H.264/AAC to keep file size within Telegram's 50 MB API limit.
-// It blocks until FFmpeg finishes and returns a descriptive error (with FFmpeg's
-// stderr) on failure.
+//  1. Concat with -c copy into a temp file — preserves correct timestamps
+//     (re-encoding directly from broken-DTS segments produces wrong durations).
+//  2. Re-encode the clean temp file with libx264 to reduce size for Telegram.
 func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath string) error {
-	args := []string{
+	// ── Pass 1: concat → temp .mp4 with stream copy ──────────────────────────
+	tempPath := outputPath + ".tmp.mp4"
+	defer os.Remove(tempPath)
+
+	pass1 := []string{
 		"-loglevel", "warning",
 		"-f", "concat",
-		"-safe", "0", // Allow absolute paths in the concat file.
-		// Regenerate PTS from scratch — prevents truncation caused by
-		// non-monotonic DTS carried over from ingestion segments.
-		"-fflags", "+genpts",
+		"-safe", "0",
 		"-i", concatPath,
-		// Re-encode video: CRF 28 + veryfast preset keeps CPU usage low on
-		// the Pi while producing files well under Telegram's 50 MB limit.
+		"-c", "copy",
+		"-movflags", "+faststart",
+		"-y",
+		tempPath,
+	}
+	if out, err := exec.CommandContext(ctx, "ffmpeg", pass1...).CombinedOutput(); err != nil {
+		return fmt.Errorf("concat pass: %w\n%s", err, out)
+	}
+
+	// ── Pass 2: re-encode temp → final MP4 for Telegram ──────────────────────
+	pass2 := []string{
+		"-loglevel", "warning",
+		"-i", tempPath,
 		"-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
-		// No audio — the camera's audio stream has broken DTS and was dropped
-		// during ingestion to prevent segment corruption.
-		"-an",
-		"-movflags", "+faststart", // Move MOOV atom to the front for streaming.
-		"-y",        // Overwrite output without asking.
+		"-c:a", "aac", "-b:a", "128k",
+		"-movflags", "+faststart",
+		"-y",
 		outputPath,
 	}
-
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-
-	// Capture combined output for error reporting.
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("exit error: %w\nffmpeg output:\n%s", err, string(out))
+	if out, err := exec.CommandContext(ctx, "ffmpeg", pass2...).CombinedOutput(); err != nil {
+		return fmt.Errorf("encode pass: %w\n%s", err, out)
 	}
+
 	return nil
 }
