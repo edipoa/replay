@@ -186,8 +186,12 @@ func writeConcatFile(path string, segments []string) error {
 
 // runFFmpegConcat runs:
 //
-//	ffmpeg -f concat -safe 0 -i <concatPath> -c copy -movflags +faststart <outputPath>
+//	ffmpeg -f concat -safe 0 -i <concatPath> \
+//	       -c:v libx264 -crf 28 -preset veryfast \
+//	       -c:a aac -b:a 128k \
+//	       -movflags +faststart <outputPath>
 //
+// Re-encodes to H.264/AAC to keep file size within Telegram's 50 MB API limit.
 // It blocks until FFmpeg finishes and returns a descriptive error (with FFmpeg's
 // stderr) on failure.
 func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath string) error {
@@ -196,7 +200,11 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 		"-f", "concat",
 		"-safe", "0", // Allow absolute paths in the concat file.
 		"-i", concatPath,
-		"-c", "copy",          // No re-encode; just remux into MP4.
+		// Re-encode video: CRF 28 + veryfast preset keeps CPU usage low on
+		// the Pi while producing files well under Telegram's 50 MB limit.
+		"-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
+		// Re-encode audio to AAC for broad compatibility.
+		"-c:a", "aac", "-b:a", "128k",
 		"-movflags", "+faststart", // Move MOOV atom to the front for streaming.
 		"-y",        // Overwrite output without asking.
 		outputPath,
