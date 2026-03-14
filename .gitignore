@@ -1,0 +1,15 @@
+# Binary
+replay-agent
+
+# Environment secrets — never commit
+.env
+
+# Go
+go.sum
+
+# Temp video files
+/tmp/
+
+# IDE
+.vscode/
+.idea/
