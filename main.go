@@ -3,78 +3,107 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/edipo/replay-saas/delivery"
-	"github.com/edipo/replay-saas/video"
+	"github.com/joho/godotenv"
 
-	"periph.io/x/conn/v3/gpio"
-	"periph.io/x/conn/v3/gpio/gpioreg"
-	"periph.io/x/host/v3"
+	"github.com/edipo/replay-saas/delivery"
+	"github.com/edipo/replay-saas/internal/envutil"
+	"github.com/edipo/replay-saas/internal/joystick"
+	"github.com/edipo/replay-saas/upload"
+	"github.com/edipo/replay-saas/video"
 )
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// appConfig holds all runtime settings loaded from environment variables.
-// Every field has a default except the three marked as required.
+type cameraConfig struct {
+	ID        string // "cam1", "cam2", …
+	RTSPUrl   string
+	BufferDir string
+}
+
 type appConfig struct {
-	// Video ingestion
-	RTSPUrl     string
-	BufferDir   string
+	// Video ingestion (one entry per configured camera)
+	Cameras     []cameraConfig
 	OutputDir   string
 	SegmentTime int
 
 	// Delivery
-	BotToken       string // required: REPLAY_BOT_TOKEN
-	ChatID         string // required: REPLAY_CHAT_ID
-	AgendaPath     string
-	TelegramLogPath string
+	BotToken            string
+	ChatID              string
+	AgendaPath          string
+	TelegramLogPath     string
+	WatermarkPath       string
+	LogoPath            string
+	BackgroundMusicPath string
 
 	// Hardware
-	GPIOPin    string // BCM pin name, e.g. "GPIO17"
-	DebounceMs int    // milliseconds to ignore re-presses after a trigger
+	JoystickID int // index of the USB joystick (0 = first device)
+	DebounceMs int
 
 	// Dev/test
-	Simulate bool // REPLAY_SIMULATE=true → Enter key instead of GPIO
+	Simulate bool
 }
 
 func loadConfig() (appConfig, error) {
 	simulate := os.Getenv("REPLAY_SIMULATE") == "true"
 
 	cfg := appConfig{
-		BufferDir:   envOr("REPLAY_BUFFER_DIR", "/tmp/replay_buffer"),
-		OutputDir:   envOr("REPLAY_OUTPUT_DIR", "/tmp/replays"),
-		SegmentTime: envIntOr("REPLAY_SEGMENT_TIME_S", 2),
-		AgendaPath:      envOr("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
-		TelegramLogPath: envOr("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
-		GPIOPin:     envOr("REPLAY_GPIO_PIN", "GPIO17"),
-		DebounceMs:  envIntOr("REPLAY_DEBOUNCE_MS", 2000),
-		Simulate:    simulate,
+		OutputDir:       envutil.Or("REPLAY_OUTPUT_DIR", "/tmp/replays"),
+		SegmentTime:     envutil.IntOr("REPLAY_SEGMENT_TIME_S", 2),
+		AgendaPath:      envutil.Or("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
+		TelegramLogPath: envutil.Or("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
+		WatermarkPath:       envutil.Or("REPLAY_WATERMARK_PATH", "watermark.png"),
+		LogoPath:            envutil.Or("REPLAY_LOGO_PATH", "logo.png"),
+		BackgroundMusicPath: os.Getenv("REPLAY_MUSIC_PATH"),
+		JoystickID:      envutil.IntOr("REPLAY_JOYSTICK_ID", 0),
+		DebounceMs:      envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
+		Simulate:        simulate,
 	}
 
-	// Required variables — fail fast so the operator knows immediately.
-	for _, r := range []struct {
-		env string
-		dst *string
-	}{
-		{"REPLAY_RTSP_URL", &cfg.RTSPUrl},
-		{"REPLAY_BOT_TOKEN", &cfg.BotToken},
-		{"REPLAY_CHAT_ID", &cfg.ChatID},
-	} {
-		v := os.Getenv(r.env)
-		if v == "" {
-			return appConfig{}, fmt.Errorf("required environment variable %s is not set", r.env)
+	// ── Camera discovery ──────────────────────────────────────────────────────
+	// Supports REPLAY_CAM_1_RTSP_URL, REPLAY_CAM_2_RTSP_URL, …
+	// REPLAY_RTSP_URL and REPLAY_BUFFER_DIR are accepted as aliases for cam1
+	// so existing single-camera deployments need no changes.
+	// ponytail: scans a fixed range instead of stopping at the first gap, so
+	// REPLAY_CAM_2_RTSP_URL still works even if cam1 is unset; raise
+	// maxCameraSlots if a rig ever needs more than 8 cameras.
+	const maxCameraSlots = 8
+	for i := 1; i <= maxCameraSlots; i++ {
+		id := fmt.Sprintf("cam%d", i)
+		url := os.Getenv(fmt.Sprintf("REPLAY_CAM_%d_RTSP_URL", i))
+		if url == "" && i == 1 {
+			url = os.Getenv("REPLAY_RTSP_URL")
 		}
-		*r.dst = v
+		if url == "" {
+			continue
+		}
+
+		bufDir := os.Getenv(fmt.Sprintf("REPLAY_CAM_%d_BUFFER_DIR", i))
+		if bufDir == "" && i == 1 {
+			bufDir = envutil.Or("REPLAY_BUFFER_DIR", "/tmp/replay_buffer")
+		}
+		if bufDir == "" {
+			bufDir = fmt.Sprintf("/tmp/replay_buffer_%d", i)
+		}
+
+		cfg.Cameras = append(cfg.Cameras, cameraConfig{ID: id, RTSPUrl: url, BufferDir: bufDir})
 	}
+
+	if len(cfg.Cameras) == 0 {
+		return appConfig{}, fmt.Errorf("required environment variable REPLAY_CAM_1_RTSP_URL (or REPLAY_RTSP_URL) is not set")
+	}
+
+	cfg.BotToken = os.Getenv("REPLAY_BOT_TOKEN")
+	cfg.ChatID = os.Getenv("REPLAY_CHAT_ID")
 
 	return cfg, nil
 }
@@ -82,6 +111,8 @@ func loadConfig() (appConfig, error) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	_ = godotenv.Load()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -100,31 +131,28 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	// ── 2. GPIO or simulate ───────────────────────────────────────────────────
-	var pin gpio.PinIn
-	if !cfg.Simulate {
-		if _, err := host.Init(); err != nil {
-			return fmt.Errorf("periph host init: %w", err)
-		}
-		p := gpioreg.ByName(cfg.GPIOPin)
-		if p == nil {
-			return fmt.Errorf("GPIO pin %q not found — check REPLAY_GPIO_PIN", cfg.GPIOPin)
-		}
-		pin = p
-		logger.Info("GPIO pin acquired", slog.String("pin", pin.Name()))
-	} else {
-		logger.Info("simulation mode: press Enter to trigger a replay")
-	}
+	// ── 2. FFmpeg binary ──────────────────────────────────────────────────────
+	ffmpegBin := findFFmpeg()
+	logger.Info("ffmpeg binary", slog.String("path", ffmpegBin))
 
-	// ── 3. Video engine ───────────────────────────────────────────────────────
-	eng, err := video.New(video.Config{
-		RTSPUrl:     cfg.RTSPUrl,
-		BufferDir:   cfg.BufferDir,
-		OutputDir:   cfg.OutputDir,
-		SegmentTime: cfg.SegmentTime,
-	}, logger)
-	if err != nil {
-		return fmt.Errorf("video engine: %w", err)
+	// ── 3. Video engines (one per camera) ────────────────────────────────────
+	var engines []*video.Engine
+	for _, cam := range cfg.Cameras {
+		eng, err := video.New(video.Config{
+			RTSPUrl:             cam.RTSPUrl,
+			BufferDir:           cam.BufferDir,
+			OutputDir:           cfg.OutputDir,
+			SegmentTime:         cfg.SegmentTime,
+			FFmpegBin:           ffmpegBin,
+			WatermarkPath:       cfg.WatermarkPath,
+			LogoPath:            cfg.LogoPath,
+			BackgroundMusicPath: cfg.BackgroundMusicPath,
+			CameraID:            cam.ID,
+		}, logger.With(slog.String("camera", cam.ID)))
+		if err != nil {
+			return fmt.Errorf("video engine %s: %w", cam.ID, err)
+		}
+		engines = append(engines, eng)
 	}
 
 	// ── 4. Delivery bot ───────────────────────────────────────────────────────
@@ -138,16 +166,41 @@ func run(logger *slog.Logger) error {
 		Level: slog.LevelInfo,
 	}))
 
-	bot, err := delivery.New(delivery.Config{
-		BotToken:   cfg.BotToken,
-		ChatID:     cfg.ChatID,
-		AgendaPath: cfg.AgendaPath,
-	}, telegramLogger)
-	if err != nil {
-		return fmt.Errorf("delivery bot: %w", err)
+	var bot *delivery.Bot
+	if cfg.BotToken != "" && cfg.ChatID != "" {
+		b, err := delivery.New(delivery.Config{
+			BotToken:   cfg.BotToken,
+			ChatID:     cfg.ChatID,
+			AgendaPath: cfg.AgendaPath,
+		}, telegramLogger)
+		if err != nil {
+			return fmt.Errorf("delivery bot: %w", err)
+		}
+		bot = b
+		logger.Info("telegram delivery enabled")
+	} else {
+		logger.Warn("telegram delivery disabled (REPLAY_BOT_TOKEN/REPLAY_CHAT_ID not set)")
 	}
 
-	// ── 5. Context + signal handling ─────────────────────────────────────────
+	// ── 5. Upload client (optional — only when R2 vars are set) ──────────────
+	var uploader *upload.Client
+	if os.Getenv("REPLAY_R2_ACCOUNT_ID") != "" {
+		u, err := upload.New(upload.Config{
+			AccountID:   os.Getenv("REPLAY_R2_ACCOUNT_ID"),
+			AccessKeyID: os.Getenv("REPLAY_R2_ACCESS_KEY_ID"),
+			SecretKey:   os.Getenv("REPLAY_R2_SECRET_ACCESS_KEY"),
+			Bucket:      os.Getenv("REPLAY_R2_BUCKET"),
+			BackendURL:  os.Getenv("REPLAY_BACKEND_URL"),
+			APIKey:      os.Getenv("REPLAY_BACKEND_API_KEY"),
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("upload client: %w", err)
+		}
+		uploader = u
+		logger.Info("r2 upload enabled", slog.String("bucket", os.Getenv("REPLAY_R2_BUCKET")))
+	}
+
+	// ── 6. Context + signal handling ─────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -155,30 +208,77 @@ func run(logger *slog.Logger) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	// ── 6. Start video ingestion ──────────────────────────────────────────────
-	eng.Start(ctx)
-	logger.Info("video ingestion started", slog.String("rtsp_url", cfg.RTSPUrl))
+	for i, eng := range engines {
+		eng.Start(ctx)
+		logger.Info("camera started",
+			slog.String("id", cfg.Cameras[i].ID),
+			slog.String("rtsp_url", cfg.Cameras[i].RTSPUrl),
+			slog.String("buffer_dir", cfg.Cameras[i].BufferDir),
+		)
+	}
+
+	// ── 6b. Start delivery queue worker ──────────────────────────────────────
+	go delivery.RunQueueWorker(ctx, cfg.OutputDir, bot, telegramLogger)
 
 	// ── 7. Button press handler ───────────────────────────────────────────────
 	//
-	// atomic flag ensures only one replay is generated at a time.
-	// If the button is pressed while a replay is already in progress, the
-	// press is logged and discarded rather than queued — the 2 s debounce
-	// already filters accidental double-presses, but the replay itself takes
-	// ~25 s, so we need the extra guard.
-	var replayActive atomic.Bool
+	// pressQueue (cap 1) holds at most one pending trigger while a replay is
+	// in progress. A second press is only enqueued if it arrives >15 s after
+	// the trigger that started the current replay — anything sooner is treated
+	// as an accidental re-press and silently dropped.
+	var (
+		replayActive  atomic.Bool
+		lastTriggerNs atomic.Int64
+		pressQueue    = make(chan time.Time, 1)
+	)
 
 	onPress := func(triggerTime time.Time) {
-		if !replayActive.CompareAndSwap(false, true) {
-			logger.Warn("button pressed – replay already in progress, ignoring")
+		if replayActive.CompareAndSwap(false, true) {
+			lastTriggerNs.Store(triggerTime.UnixNano())
+			go func() {
+				t := triggerTime
+				for {
+					// Fire all cameras concurrently; wait for all before
+					// accepting the next queued press or releasing the lock.
+					var wg sync.WaitGroup
+					for i, eng := range engines {
+						wg.Add(1)
+						go func(e *video.Engine, camID string) {
+							defer wg.Done()
+							runReplay(ctx, e, camID, uploader, logger, t)
+						}(eng, cfg.Cameras[i].ID)
+					}
+					wg.Wait()
+
+					if ctx.Err() != nil {
+						replayActive.Store(false)
+						return
+					}
+					select {
+					case t = <-pressQueue:
+						lastTriggerNs.Store(t.UnixNano())
+					default:
+						replayActive.Store(false)
+						return
+					}
+				}
+			}()
 			return
 		}
-		go func() {
-			defer replayActive.Store(false)
-			runReplay(ctx, eng, bot, logger, triggerTime)
-		}()
+
+		since := triggerTime.Sub(time.Unix(0, lastTriggerNs.Load()))
+		if since < 15*time.Second {
+			return
+		}
+		select {
+		case pressQueue <- triggerTime:
+			logger.Info("clip queued for next generation", slog.Time("trigger", triggerTime))
+		default:
+			logger.Warn("press queue full, ignoring", slog.Time("trigger", triggerTime))
+		}
 	}
 
-	// ── 8. Input listener goroutine (GPIO or stdin) ───────────────────────────
+	// ── 8. Input listener goroutine ───────────────────────────────────────────
 	debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
 	listenerDone := make(chan error, 1)
 
@@ -192,10 +292,10 @@ func run(logger *slog.Logger) error {
 		)
 	} else {
 		go func() {
-			listenerDone <- runButtonListener(ctx, pin, debounce, onPress)
+			listenerDone <- runJoystickListener(ctx, cfg.JoystickID, debounce, onPress)
 		}()
 		logger.Info("replay agent ready",
-			slog.String("gpio_pin", cfg.GPIOPin),
+			slog.Int("joystick_id", cfg.JoystickID),
 			slog.Int("debounce_ms", cfg.DebounceMs),
 		)
 	}
@@ -212,116 +312,166 @@ func run(logger *slog.Logger) error {
 
 	logger.Info("shutting down…")
 	cancel()
-	eng.Wait() // blocks until ingestion + cleanup goroutines stop
+	for _, eng := range engines {
+		eng.Wait()
+	}
 	logger.Info("shutdown complete")
 	return nil
 }
 
 // ─── Replay orchestration ─────────────────────────────────────────────────────
 
-// runReplay is called in its own goroutine every time the button is pressed.
-// It chains GenerateReplay → Deliver and logs the outcome; it never panics.
+// runReplay generates a clip for triggerTime, optionally uploads it to R2,
+// and saves it to the pending queue for Telegram delivery.
 func runReplay(
 	ctx context.Context,
 	eng *video.Engine,
-	bot *delivery.Bot,
+	cameraID string,
+	uploader *upload.Client,
 	logger *slog.Logger,
 	triggerTime time.Time,
 ) {
-	log := logger.With(slog.Time("trigger", triggerTime))
+	log := logger.With(slog.Time("trigger", triggerTime), slog.String("camera", cameraID))
 	log.Info("replay: generating clip")
 
 	replayPath, err := eng.GenerateReplay(ctx, triggerTime)
 	if err != nil {
 		if ctx.Err() != nil {
-			return // graceful shutdown, not an error
+			return
 		}
 		log.Error("replay: generation failed", slog.Any("error", err))
 		return
 	}
-	log.Info("replay: clip ready, delivering", slog.String("path", replayPath))
+	log.Info("replay: clip saved to queue", slog.String("path", replayPath))
 
-	if err := bot.Deliver(ctx, replayPath, triggerTime); err != nil {
-		if errors.Is(err, delivery.ErrNoSlotFound) {
-			// Configuration issue, not a transient error — warn and move on.
-			log.Warn("replay: no agenda slot found, delivery skipped", slog.Any("error", err))
-			return
+	// Keep the queue worker from moving this file out of pending/ while it's
+	// still being read here (R2 upload, preview generation).
+	unlock := delivery.Lock(replayPath)
+	defer unlock()
+
+	if uploader != nil {
+		videoID := upload.NewID()
+		r2Key, err := uploader.Upload(ctx, replayPath, videoID)
+		if err != nil {
+			log.Error("replay: r2 upload failed", slog.Any("error", err))
+		} else {
+			log.Info("replay: uploaded to r2", slog.String("key", r2Key))
+
+			var thumbnailKey string
+			previewPath := replayPath + ".preview.gif"
+			if err := eng.GeneratePreview(ctx, replayPath, previewPath); err != nil {
+				log.Warn("replay: preview generation failed", slog.Any("error", err))
+			} else {
+				if key, err := uploader.UploadPreview(ctx, previewPath, videoID); err != nil {
+					log.Warn("replay: preview upload failed", slog.Any("error", err))
+				} else {
+					thumbnailKey = key
+					log.Info("replay: preview uploaded", slog.String("key", key))
+				}
+				_ = os.Remove(previewPath)
+			}
+
+			meta := upload.VideoMeta{
+				ID:           videoID,
+				CameraID:     cameraID,
+				R2Key:        r2Key,
+				ThumbnailKey: thumbnailKey,
+				DurationS:    int(eng.ClipDuration().Seconds()),
+				SizeBytes:    fileSize(replayPath),
+				TriggeredAt:  triggerTime,
+			}
+			if err := uploader.Notify(ctx, meta); err != nil {
+				log.Warn("replay: backend notify failed", slog.Any("error", err))
+			}
 		}
-		log.Error("replay: delivery failed", slog.Any("error", err))
-		return
 	}
-
-	log.Info("replay: delivered successfully")
 }
 
-// ─── GPIO button listener ─────────────────────────────────────────────────────
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
 
-// runButtonListener configures pin as an input with a pull-up resistor and
-// calls onPress with the current time whenever a falling edge (button pressed
-// to GND) is detected outside the debounce window.
-//
-// It returns nil when ctx is cancelled (clean shutdown) or a non-nil error if
-// the GPIO driver reports a failure.
-//
-// Wiring assumption: one leg of the button to the GPIO pin, other leg to GND.
-// The internal pull-up holds the pin HIGH when idle; pressing pulls it LOW.
-func runButtonListener(
+// ─── Debouncer ───────────────────────────────────────────────────────────────
+
+// debouncer gates rapid repeated calls: Allow returns (now, true) only when at
+// least d has elapsed since the last allowed call.
+type debouncer struct {
+	d    time.Duration
+	last time.Time
+}
+
+func (db *debouncer) Allow() (time.Time, bool) {
+	now := time.Now().UTC()
+	if now.Sub(db.last) < db.d {
+		return now, false
+	}
+	db.last = now
+	return now, true
+}
+
+// ─── Joystick listener ────────────────────────────────────────────────────────
+
+// runJoystickListener polls a USB joystick/gamepad every 20 ms and calls
+// onPress on every button press outside the debounce window.
+// Works on Linux (/dev/input/js{id}) and Windows (winmm.dll joyGetPosEx).
+func runJoystickListener(
 	ctx context.Context,
-	pin gpio.PinIn,
-	debounce time.Duration,
+	joystickID int,
+	d time.Duration,
 	onPress func(time.Time),
 ) error {
-	if err := pin.In(gpio.PullUp, gpio.BothEdges); err != nil {
-		return fmt.Errorf("configure pin %s: %w", pin.Name(), err)
+	js, err := joystick.Open(joystickID)
+	if err != nil {
+		return fmt.Errorf("open joystick %d: %w", joystickID, err)
 	}
+	defer js.Close()
 
-	const pollInterval = 200 * time.Millisecond
-	var lastPress time.Time
+	var prevButtons uint32
+	db := debouncer{d: d}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
-		// Check for shutdown before blocking.
 		select {
 		case <-ctx.Done():
 			return nil
-		default:
-		}
+		case <-ticker.C:
+			buttons, err := js.Poll()
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("read joystick: %w", err)
+			}
 
-		// WaitForEdge blocks for up to pollInterval, then returns false (timeout).
-		// This keeps the loop responsive to context cancellation.
-		if !pin.WaitForEdge(pollInterval) {
-			continue
-		}
+			// Detect 0→1 transitions (press, not hold).
+			pressed := buttons &^ prevButtons
+			prevButtons = buttons
 
-		// Read the current level to distinguish press (Low) from release (High).
-		if pin.Read() != gpio.Low {
-			continue // rising edge → button released, ignore
-		}
+			if pressed == 0 {
+				continue
+			}
 
-		// Falling edge → button pressed.
-		now := time.Now()
-		if now.Sub(lastPress) < debounce {
-			continue // within debounce window, discard
+			if now, ok := db.Allow(); ok {
+				onPress(now)
+			}
 		}
-		lastPress = now
-
-		onPress(now)
 	}
 }
 
 // ─── Stdin listener (simulate mode) ──────────────────────────────────────────
 
-// runStdinListener reads lines from stdin. Every Enter key press (empty line
-// or any text) is treated as a button press, subject to the same debounce
-// window used in production. Ctrl+C still exits via the OS signal handler.
-func runStdinListener(ctx context.Context, debounce time.Duration, onPress func(time.Time)) error {
+func runStdinListener(ctx context.Context, d time.Duration, onPress func(time.Time)) error {
 	scanner := bufio.NewScanner(os.Stdin)
-	var lastPress time.Time
+	db := debouncer{d: d}
 
 	fmt.Println("[ simulate ] press Enter to trigger a replay (Ctrl+C to quit)")
 
 	for {
-		// bufio.Scanner.Scan() blocks — run it in a goroutine so we can also
-		// watch for context cancellation without leaking the goroutine.
 		type scanResult struct{ ok bool }
 		ch := make(chan scanResult, 1)
 		go func() { ch <- scanResult{ok: scanner.Scan()} }()
@@ -331,44 +481,42 @@ func runStdinListener(ctx context.Context, debounce time.Duration, onPress func(
 			return nil
 		case res := <-ch:
 			if !res.ok {
-				return scanner.Err() // EOF or read error
+				return scanner.Err()
 			}
 		}
 
-		now := time.Now()
-		if now.Sub(lastPress) < debounce {
-			fmt.Printf("[ simulate ] debounce — ignoring (wait %v)\n",
-				debounce-now.Sub(lastPress))
-			continue
+		if now, ok := db.Allow(); ok {
+			onPress(now)
+		} else {
+			fmt.Printf("[ simulate ] debounce — ignoring (wait %v)\n", d-time.Since(db.last))
 		}
-		lastPress = now
-		onPress(now)
 	}
 }
 
+// ─── FFmpeg discovery ─────────────────────────────────────────────────────────
+
+// findFFmpeg returns the path to the ffmpeg binary. It first looks for a
+// bundled binary alongside the executable, then falls back to PATH.
+func findFFmpeg() string {
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range []string{"ffmpeg", "ffmpeg.exe"} {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	return "ffmpeg"
+}
+
+
 // ─── Env helpers ──────────────────────────────────────────────────────────────
 
-// agendaDefault returns a sensible default path for agenda.json depending
-// on whether we're running in simulate (local dev) or production (Docker).
 func agendaDefault(simulate bool) string {
 	if simulate {
 		return "./agenda.json"
 	}
 	return "/etc/replay/agenda.json"
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envIntOr(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return fallback
 }

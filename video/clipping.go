@@ -92,8 +92,8 @@ func (e *Engine) GenerateReplay(ctx context.Context, triggerTime time.Time) (str
 
 	// ── 4. Run FFmpeg concat pass ─────────────────────────────────────────────
 	outputPath := filepath.Join(
-		e.cfg.OutputDir,
-		fmt.Sprintf("replay_%s.mp4", triggerTime.Format("20060102_150405")),
+		e.cfg.OutputDir, "pending",
+		fmt.Sprintf("replay_%s_%s.mp4", triggerTime.Format("20060102_150405"), e.cfg.CameraID),
 	)
 
 	log.Info("running FFmpeg concat", slog.String("output", outputPath))
@@ -106,6 +106,26 @@ func (e *Engine) GenerateReplay(ctx context.Context, triggerTime time.Time) (str
 
 	log.Info("replay ready", slog.String("output", outputPath))
 	return outputPath, nil
+}
+
+// GeneratePreview creates an animated GIF from mp4Path covering the full clip (5 fps, 640 px wide)
+// and writes it to outputPath.
+func (e *Engine) GeneratePreview(ctx context.Context, mp4Path, outputPath string) error {
+	return e.runFFmpegPass(ctx, "gif encode", []string{
+		"-loglevel", "warning",
+		"-i", mp4Path,
+		"-vf", "fps=5,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+		"-y",
+		outputPath,
+	})
+}
+
+// runFFmpegPass runs a single ffmpeg invocation and returns a labelled error on failure.
+func (e *Engine) runFFmpegPass(ctx context.Context, passName string, args []string) error {
+	if out, err := exec.CommandContext(ctx, e.cfg.FFmpegBin, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %w\n%s", passName, err, out)
+	}
+	return nil
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -159,6 +179,11 @@ func (e *Engine) collectSegments(windowStart, windowEnd time.Time) ([]string, er
 	return paths, nil
 }
 
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // writeConcatFile writes an FFmpeg concat demuxer input file.
 //
 // Format:
@@ -175,6 +200,9 @@ func writeConcatFile(path string, segments []string) error {
 
 	w := bufio.NewWriter(f)
 	for _, seg := range segments {
+		// Forward slashes are required: FFmpeg's concat demuxer treats backslash
+		// paths as relative on Windows (no drive letter → prepends concat dir).
+		seg = filepath.ToSlash(seg)
 		// Escape single quotes inside the path (POSIX shell style).
 		escaped := strings.ReplaceAll(seg, "'", `'\''`)
 		if _, err := fmt.Fprintf(w, "file '%s'\n", escaped); err != nil {
@@ -190,8 +218,13 @@ func writeConcatFile(path string, segments []string) error {
 //     (re-encoding directly from broken-DTS segments produces wrong durations).
 //  2. Re-encode the clean temp file with libx264 to reduce size for Telegram.
 func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath string) error {
-	// ── Pass 1: concat → temp .mp4 with stream copy ──────────────────────────
-	tempPath := outputPath + ".tmp.mp4"
+	// ── Pass 1: concat → temp .ts with stream copy ───────────────────────────
+	// Keep the intermediate as MPEG-TS (not MP4) so H264 stays in Annex B
+	// format throughout. Converting TS→MP4 in stream-copy mode requires a
+	// bitstream format change (Annex B → AVCC) that some FFmpeg builds
+	// mishandle, producing an MP4 with garbage NAL unit sizes that cause
+	// nearly all frames to fail decoding in pass 2.
+	tempPath := outputPath + ".tmp.ts"
 	defer os.Remove(tempPath)
 
 	pass1 := []string{
@@ -200,29 +233,121 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 		"-safe", "0",
 		"-i", concatPath,
 		"-c", "copy",
-		"-movflags", "+faststart",
 		"-y",
 		tempPath,
 	}
-	if out, err := exec.CommandContext(ctx, "ffmpeg", pass1...).CombinedOutput(); err != nil {
-		return fmt.Errorf("concat pass: %w\n%s", err, out)
+	if err := e.runFFmpegPass(ctx, "concat pass", pass1); err != nil {
+		return err
 	}
 
-	// ── Pass 2: re-encode temp → final MP4 for Telegram ──────────────────────
+	// ── Pass 2: re-encode temp .ts → final MP4 for Telegram ──────────────────
+	// Reading from MPEG-TS (native Annex B H264) avoids the AVCC decode errors
+	// that occur when reading a stream-copied MP4 with broken extradata.
+	// -fflags +discardcorrupt: skip malformed AAC frames at TS segment
+	// boundaries (common with IP Webcam / phone RTSP sources).
+	// -max_error_rate 1.0: don't abort on high decode error rate (newer FFmpeg
+	// default is 0.666 which kills the process before producing any output).
+	hasWatermark := fileExists(e.cfg.WatermarkPath)
+	hasLogo := fileExists(e.cfg.LogoPath)
+	hasMusic := e.cfg.BackgroundMusicPath != "" && fileExists(e.cfg.BackgroundMusicPath)
+
+	// When music is requested, pass 2 encodes to a temp file; pass 3 muxes the
+	// music in. This avoids filter-graph buffer overflows that occur when a
+	// stream_loop audio input races against corrupt video frames.
+	pass2Out := outputPath
+	tempVideoPath := ""
+	if hasMusic {
+		tempVideoPath = outputPath + ".tmp.mp4"
+		pass2Out = tempVideoPath
+		defer os.Remove(tempVideoPath)
+	}
+
+	// ── Pass 2: re-encode with overlays ──────────────────────────────────────
 	pass2 := []string{
+		"-fflags", "+discardcorrupt",
+		"-max_error_rate", "1.0",
 		"-loglevel", "warning",
 		"-i", tempPath,
-		// Scale to 720p max — reduces encode time significantly on edge devices.
-	// ultrafast preset trades compression ratio for CPU speed.
-	"-vf", "scale=1280:-2",
-	"-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",
-		"-c:a", "aac", "-b:a", "128k",
-		"-movflags", "+faststart",
-		"-y",
-		outputPath,
 	}
-	if out, err := exec.CommandContext(ctx, "ffmpeg", pass2...).CombinedOutput(); err != nil {
-		return fmt.Errorf("encode pass: %w\n%s", err, out)
+
+	if hasWatermark {
+		e.logger.Info("applying watermark", slog.String("path", e.cfg.WatermarkPath))
+		pass2 = append(pass2, "-i", e.cfg.WatermarkPath)
+	} else {
+		e.logger.Warn("watermark not found, skipping", slog.String("path", e.cfg.WatermarkPath))
+	}
+	if hasLogo {
+		e.logger.Info("applying arena logo", slog.String("path", e.cfg.LogoPath))
+		pass2 = append(pass2, "-i", e.cfg.LogoPath)
+	} else {
+		e.logger.Warn("arena logo not found, skipping", slog.String("path", e.cfg.LogoPath))
+	}
+
+	// Build the video portion of the filter graph.
+	// watermark → bottom-left  (10:H-h-10)
+	// logo      → bottom-right (W-w-10:H-h-10)
+	switch {
+	case hasWatermark && hasLogo:
+		pass2 = append(pass2,
+			"-filter_complex", "[0:v]scale=1280:-2[sc];[2:v]scale=80:-1[logo];[sc][1:v]overlay=10:H-h-10[wm];[wm][logo]overlay=W-w-10:H-h-10[outv]",
+			"-map", "[outv]",
+			"-map", "0:a?",
+		)
+	case hasWatermark:
+		pass2 = append(pass2,
+			"-filter_complex", "[0:v]scale=1280:-2[sc];[sc][1:v]overlay=10:H-h-10[outv]",
+			"-map", "[outv]",
+			"-map", "0:a?",
+		)
+	case hasLogo:
+		pass2 = append(pass2,
+			"-filter_complex", "[0:v]scale=1280:-2[sc];[1:v]scale=80:-1[logo];[sc][logo]overlay=W-w-10:H-h-10[outv]",
+			"-map", "[outv]",
+			"-map", "0:a?",
+		)
+	default:
+		pass2 = append(pass2, "-vf", "scale=1280:-2")
+	}
+
+	pass2 = append(pass2,
+		"-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",
+		"-c:a", "aac", "-b:a", "128k",
+	)
+	if !hasMusic {
+		// This pass writes straight to outputPath, so make it stream-friendly.
+		pass2 = append(pass2, "-movflags", "+faststart")
+	}
+	pass2 = append(pass2, "-y", pass2Out)
+	if err := e.runFFmpegPass(ctx, "encode pass", pass2); err != nil {
+		return err
+	}
+
+	// ── Pass 3 (optional): mux background music ───────────────────────────────
+	// Video is already encoded, so this pass uses stream-copy for video (fast).
+	// Mixes the clip's own audio with the music bed instead of replacing it —
+	// -shortest stops both when the video ends.
+	// ponytail: assumes the clip has an audio track (0:a); add an ffprobe
+	// presence check first if cameras without audio start using music.
+	if hasMusic {
+		e.logger.Info("applying background music", slog.String("path", e.cfg.BackgroundMusicPath))
+		pass3 := []string{
+			"-loglevel", "warning",
+			"-i", tempVideoPath,
+			"-stream_loop", "-1",
+			"-i", e.cfg.BackgroundMusicPath,
+			"-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.07[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+			"-map", "0:v",
+			"-map", "[aout]",
+			"-c:v", "copy",
+			"-c:a", "aac", "-b:a", "128k",
+			"-shortest",
+			"-movflags", "+faststart",
+			"-y",
+			outputPath,
+		}
+		if err := e.runFFmpegPass(ctx, "music pass", pass3); err != nil {
+			return err
+		}
 	}
 
 	return nil

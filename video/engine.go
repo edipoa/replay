@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -21,7 +22,7 @@ const (
 	// segmentTimeLayout is the Go time.Parse counterpart of segmentFilePattern.
 	segmentTimeLayout = "20060102_150405"
 
-	cleanupInterval   = 10 * time.Second
+	cleanupInterval    = 10 * time.Second
 	reconnectBaseDelay = 2 * time.Second
 	reconnectMaxDelay  = 30 * time.Second
 
@@ -61,6 +62,29 @@ type Config struct {
 	// PostCapture is how far after the trigger to include in the replay.
 	// Default: 10s
 	PostCapture time.Duration
+
+	// FFmpegBin is the path to the ffmpeg executable.
+	// Default: "ffmpeg" (resolved from PATH or bundled binary by the caller).
+	FFmpegBin string
+
+	// WatermarkPath is the path to the company watermark PNG, burned into the
+	// bottom-left corner of every clip. Silently skipped if the file is absent.
+	// Default: "watermark.png" (relative to the working directory).
+	WatermarkPath string
+
+	// LogoPath is the path to the arena logo PNG, burned into the bottom-right
+	// corner of every clip. Silently skipped if the file is absent.
+	// Default: "logo.png" (relative to the working directory).
+	LogoPath string
+
+	// BackgroundMusicPath is the path to an audio file (MP3, AAC, …) looped as
+	// low-volume background music in every clip. Silently skipped when empty or
+	// absent. Default: "" (disabled).
+	BackgroundMusicPath string
+
+	// CameraID is a short label embedded in output filenames (e.g. "cam1").
+	// Default: "cam1"
+	CameraID string
 }
 
 func (c *Config) applyDefaults() {
@@ -81,6 +105,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PostCapture == 0 {
 		c.PostCapture = 10 * time.Second
+	}
+	if c.FFmpegBin == "" {
+		c.FFmpegBin = "ffmpeg"
+	}
+	if c.WatermarkPath == "" {
+		c.WatermarkPath = "watermark.png"
+	}
+	if c.LogoPath == "" {
+		c.LogoPath = "logo.png"
+	}
+	if c.CameraID == "" {
+		c.CameraID = "cam1"
 	}
 }
 
@@ -111,6 +147,11 @@ func New(cfg Config, logger *slog.Logger) (*Engine, error) {
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("video: create output dir %q: %w", cfg.OutputDir, err)
 	}
+	for _, sub := range []string{"pending", "delivered"} {
+		if err := os.MkdirAll(filepath.Join(cfg.OutputDir, sub), 0o755); err != nil {
+			return nil, fmt.Errorf("video: create %s dir: %w", sub, err)
+		}
+	}
 
 	return &Engine{cfg: cfg, logger: logger}, nil
 }
@@ -139,4 +180,9 @@ func (e *Engine) Start(ctx context.Context) {
 func (e *Engine) Wait() {
 	e.wg.Wait()
 	e.logger.Info("video engine stopped")
+}
+
+// ClipDuration returns the nominal clip length (PreCapture + PostCapture).
+func (e *Engine) ClipDuration() time.Duration {
+	return e.cfg.PreCapture + e.cfg.PostCapture
 }

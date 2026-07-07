@@ -2,11 +2,11 @@ services:
   replay-agent:
     build:
       context: .
-      # Match the CPU architecture of your edge device:
+      # Match the CPU architecture of your device:
+      #   amd64  → PC, NUC, generic x86-64
       #   arm64  → Raspberry Pi 4 / 5, Jetson Nano
-      #   amd64  → NUC, generic mini PC
       args:
-        TARGETARCH: arm64
+        TARGETARCH: amd64
 
     image: replay-agent:latest
 
@@ -19,19 +19,28 @@ services:
       - .env
     environment:
       # Paths inside the container — must match the volume targets below.
-      REPLAY_BUFFER_DIR:  /tmp/replay_buffer
-      REPLAY_OUTPUT_DIR:  /tmp/replays
-      REPLAY_AGENDA_PATH: /etc/replay/agenda.json
+      # Camera 1 (backward-compatible alias — same as REPLAY_CAM_1_BUFFER_DIR)
+      REPLAY_BUFFER_DIR:         /tmp/replay_buffer_1
+      # Uncomment and set REPLAY_CAM_2_RTSP_URL in .env to enable second camera:
+      # REPLAY_CAM_2_BUFFER_DIR: /tmp/replay_buffer_2
+      REPLAY_OUTPUT_DIR:         /tmp/replays
+      REPLAY_AGENDA_PATH:        /etc/replay/agenda.json
+      REPLAY_JOYSTICK_ID:        0
+      REPLAY_WATERMARK_PATH:     /etc/replay/watermark.png
 
     # ── Volumes ──────────────────────────────────────────────────────────────
     volumes:
-      # Rolling segment buffer — tmpfs so segments never hit the SSD.
-      # The video engine enforces 60 s retention; tmpfs adds a hardware-level
-      # safety net and gives the fastest possible I/O for FFmpeg segment writes.
+      # Rolling segment buffers — tmpfs so segments never hit the SSD.
+      # Add a second block (targeting /tmp/replay_buffer_2) when using cam2.
       - type: tmpfs
-        target: /tmp/replay_buffer
+        target: /tmp/replay_buffer_1
         tmpfs:
           size: 524288000   # 500 MiB ≈ 4 min of 1080p @ 500 kbps
+      # Uncomment to enable second camera buffer:
+      # - type: tmpfs
+      #   target: /tmp/replay_buffer_2
+      #   tmpfs:
+      #     size: 524288000
 
       # Finished .mp4 replays persisted on the host so they survive restarts
       # and can be inspected or re-uploaded manually.
@@ -41,23 +50,19 @@ services:
       # (changes take effect on the next button press, no rebuild needed).
       - ./agenda.json:/etc/replay/agenda.json:ro
 
-      # ── sysfs GPIO (portable, works alongside or instead of /dev/gpiomem) ──
-      # periph.io's sysfs driver uses these to enumerate and drive GPIO pins.
-      - /sys/class/gpio:/sys/class/gpio
-      - /sys/devices/platform:/sys/devices/platform
+      # Watermark PNG burned into every replay clip.
+      - ./faz-o-clip-watermark-220.png:/etc/replay/watermark.png:ro
 
-    # ── GPIO devices ─────────────────────────────────────────────────────────
-    # periph.io supports two Linux GPIO backends at runtime; we enable both:
-    #   bcm283x  — memory-mapped, fastest, Raspberry Pi only → /dev/gpiomem
-    #   sysfs    — generic kernel interface            → /sys (volumes above)
+    # ── Input devices ─────────────────────────────────────────────────────────
+    # Pass the USB arcade encoder through to the container.
+    # To find the right event number: `ls -l /dev/input/by-id/` on the host.
     devices:
-      - /dev/gpiomem:/dev/gpiomem
+      - /dev/input/js0:/dev/input/js0
 
-    # Add the host's "gpio" group so the process can open /dev/gpiomem without
-    # running as root.  On Raspberry Pi OS: `getent group gpio` → GID 997.
-    # Adjust if your distro uses a different GID.
+    # Add the host's "input" group so the process can open /dev/input/js0
+    # without running as root. Check the GID with: `getent group input`
     group_add:
-      - "997"
+      - "999"
 
     # ── Logging ──────────────────────────────────────────────────────────────
     logging:

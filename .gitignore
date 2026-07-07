@@ -1,8 +1,19 @@
 # Binary
 replay-agent
+/seed
+/setup-r2
+/setup-topics
+/replay-saas
+/dist/
+*.exe
+*.zip
+
+# Locally-downloaded ffmpeg binaries + optional music (see Makefile)
+/tools/
 
 # Environment secrets — never commit
 .env
+.env.*
 
 # Go
 go.sum

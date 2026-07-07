@@ -97,7 +97,9 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 		segPath,
 	}
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, e.cfg.FFmpegBin, args...)
+	// Force UTC so -strftime filenames match the UTC wall clock used everywhere else.
+	cmd.Env = append(os.Environ(), "TZ=UTC")
 
 	// Send SIGTERM on context cancellation instead of the default SIGKILL,
 	// giving FFmpeg a chance to flush and close the current segment cleanly.
@@ -160,7 +162,7 @@ func (e *Engine) runCleanup(ctx context.Context) {
 // cleanOldSegments deletes every .ts file in BufferDir whose segment start time
 // is older than now minus cfg.BufferDur.
 func (e *Engine) cleanOldSegments() {
-	cutoff := time.Now().Add(-e.cfg.BufferDur)
+	cutoff := time.Now().UTC().Add(-e.cfg.BufferDur)
 	log := e.logger.With(slog.String("component", "cleanup"), slog.Time("cutoff", cutoff))
 
 	entries, err := os.ReadDir(e.cfg.BufferDir)
@@ -222,5 +224,5 @@ func parseSegmentTime(name string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("unexpected segment filename: %q", name)
 	}
 
-	return time.ParseInLocation(segmentTimeLayout, ts, time.Local)
+	return time.Parse(segmentTimeLayout, ts)
 }
