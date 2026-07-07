@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -45,23 +46,14 @@ func main() {
 
 	ctx := context.Background()
 
-	rules := []types.LifecycleRule{
-		{
-			ID:     aws.String("expire-videos-24h"),
-			Status: types.ExpirationStatusEnabled,
-			Filter: &types.LifecycleRuleFilterMemberPrefix{Value: "videos/"},
-			Expiration: &types.LifecycleExpiration{
-				Days: aws.Int32(1),
-			},
-		},
-		{
-			ID:     aws.String("expire-previews-24h"),
-			Status: types.ExpirationStatusEnabled,
-			Filter: &types.LifecycleRuleFilterMemberPrefix{Value: "previews/"},
-			Expiration: &types.LifecycleExpiration{
-				Days: aws.Int32(1),
-			},
-		},
+	var rules []types.LifecycleRule
+	for _, prefix := range []string{"videos/", "previews/"} {
+		rules = append(rules, types.LifecycleRule{
+			ID:         aws.String("expire-" + strings.TrimSuffix(prefix, "/") + "-24h"),
+			Status:     types.ExpirationStatusEnabled,
+			Filter:     &types.LifecycleRuleFilterMemberPrefix{Value: prefix},
+			Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
+		})
 	}
 
 	_, err := s3client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{

@@ -78,10 +78,11 @@ func main() {
 		time.Sleep(2 * time.Second) // evitar rate-limit do Telegram
 	}
 
-	out, err := marshalAgenda(agenda, keys)
+	out, err := json.MarshalIndent(agenda, "", "  ")
 	if err != nil {
 		log.Fatalf("serializar agenda: %v", err)
 	}
+	out = append(out, '\n')
 	if err := os.WriteFile(agendaPath, out, 0o644); err != nil {
 		log.Fatalf("salvar agenda: %v", err)
 	}
@@ -147,22 +148,6 @@ func createTopic(client *http.Client, token, chatID, name string) (int64, error)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-// marshalAgenda serializa preservando a ordem original das chaves.
-func marshalAgenda(agenda map[string]int64, orderedKeys []string) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteString("{\n")
-	for i, k := range orderedKeys {
-		keyJSON, _ := json.Marshal(k)
-		line := fmt.Sprintf("  %s: %d", keyJSON, agenda[k])
-		if i < len(orderedKeys)-1 {
-			line += ","
-		}
-		buf.WriteString(line + "\n")
-	}
-	buf.WriteString("}\n")
-	return buf.Bytes(), nil
-}
 
 func sortedKeys(m map[string]int64) []string {
 	keys := make([]string, 0, len(m))

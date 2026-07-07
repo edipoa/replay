@@ -47,10 +47,6 @@ type Config struct {
 
 	// AgendaPath is the file-system path to agenda.json.
 	AgendaPath string
-
-	// HTTPTimeout overrides the default HTTP client timeout (90 s).
-	// Set to a larger value for slow uplinks.
-	HTTPTimeout time.Duration
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -78,14 +74,9 @@ func New(cfg Config, logger *slog.Logger) (*Bot, error) {
 		logger = slog.Default()
 	}
 
-	timeout := cfg.HTTPTimeout
-	if timeout == 0 {
-		timeout = defaultHTTPTimeout
-	}
-
 	return &Bot{
 		cfg:    cfg,
-		client: &http.Client{Timeout: timeout},
+		client: &http.Client{Timeout: defaultHTTPTimeout},
 		logger: logger,
 	}, nil
 }
