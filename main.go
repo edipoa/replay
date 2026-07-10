@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/edipo/replay-saas/delivery"
 	"github.com/edipo/replay-saas/internal/envutil"
 	"github.com/edipo/replay-saas/internal/joystick"
+	"github.com/edipo/replay-saas/internal/selftest"
 	"github.com/edipo/replay-saas/upload"
 	"github.com/edipo/replay-saas/video"
 )
@@ -133,6 +135,11 @@ func run(logger *slog.Logger) error {
 
 	// ── 2. FFmpeg binary ──────────────────────────────────────────────────────
 	ffmpegBin := findFFmpeg()
+	if ffmpegBin == "ffmpeg" {
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			return fmt.Errorf("no working ffmpeg found (bundled binary failed its self-test and none on PATH) — run: sudo apt install ffmpeg")
+		}
+	}
 	logger.Info("ffmpeg binary", slog.String("path", ffmpegBin))
 
 	// ── 3. Video engines (one per camera) ────────────────────────────────────
@@ -497,18 +504,44 @@ func runStdinListener(ctx context.Context, d time.Duration, onPress func(time.Ti
 
 // findFFmpeg returns the path to the ffmpeg binary. It first looks for a
 // bundled binary alongside the executable, then falls back to PATH.
+//
+// The bundled binary is a prebuilt static build and isn't guaranteed to run
+// on every host — some CPU/kernel combos make it segfault on real demuxing
+// while "-version" still succeeds, so it's health-checked with an actual
+// decode before being trusted.
 func findFFmpeg() string {
 	exe, err := os.Executable()
 	if err == nil {
 		dir := filepath.Dir(exe)
 		for _, name := range []string{"ffmpeg", "ffmpeg.exe"} {
 			candidate := filepath.Join(dir, name)
-			if _, err := os.Stat(candidate); err == nil {
+			if _, err := os.Stat(candidate); err == nil && ffmpegWorks(candidate) {
 				return candidate
 			}
 		}
 	}
 	return "ffmpeg"
+}
+
+// ffmpegWorks demuxes and decodes a tiny embedded real H264/MPEG-TS clip to
+// confirm the binary actually works on this host. A synthetic lavfi source
+// isn't enough — it bypasses the file demuxer and H264 decoder entirely, the
+// exact code paths that segfault on some prebuilt static ffmpeg binaries
+// even though "-version" runs fine.
+func ffmpegWorks(path string) bool {
+	tmp, err := os.CreateTemp("", "ffmpeg-selftest-*.ts")
+	if err != nil {
+		return false
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(selftest.ClipTS); err != nil {
+		tmp.Close()
+		return false
+	}
+	tmp.Close()
+
+	cmd := exec.Command(path, "-v", "quiet", "-i", tmp.Name(), "-f", "null", "-")
+	return cmd.Run() == nil
 }
 
 

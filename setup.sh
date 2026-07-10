@@ -10,60 +10,91 @@ echo -e "${BLUE}║      Replay Agent — Configuração     ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
 echo ""
 
-# Carrega valores atuais do .env se existir
-_get() { grep -m1 "^$1=" .env 2>/dev/null | cut -d= -f2- || true; }
+# Carrega valor atual do .env (comentado ou não) se existir
+_get() { grep -m1 "^#\? *$1=" .env 2>/dev/null | cut -d= -f2- || true; }
 
-DEFAULT_RTSP="$(_get REPLAY_CAM_1_RTSP_URL)"
-DEFAULT_RTSP="${DEFAULT_RTSP:-rtsp://192.168.42.1:8080/video}"
+# Define (ou comenta, se valor vazio) uma chave no .env
+_set() {
+    local key="$1" val="$2"
+    if [ -n "$val" ]; then
+        # escapa & \ e | (delimitador do sed) para não virarem código no replacement
+        local esc_val; esc_val="$(printf '%s' "$val" | sed -e 's/[\&|]/\\&/g')"
+        if grep -q "^$key=" .env; then
+            sed -i "s|^$key=.*|$key=$esc_val|" .env
+        else
+            sed -i "s|^#\? *$key=.*|$key=$esc_val|" .env
+        fi
+    else
+        sed -i "s|^$key=.*|# $key=|" .env
+    fi
+}
 
-echo -e "${YELLOW}1. URL da câmera (RTSP)${NC}"
+DEFAULT_RTSP_1="$(_get REPLAY_CAM_1_RTSP_URL)"
+DEFAULT_RTSP_1="${DEFAULT_RTSP_1:-rtsp://192.168.42.1:8080/video}"
+DEFAULT_RTSP_2="$(_get REPLAY_CAM_2_RTSP_URL)"
+
+echo -e "${YELLOW}1. URL da câmera 1 (RTSP)${NC}"
 echo "   Padrão IP Webcam via USB Tethering: rtsp://192.168.42.1:8080/video"
-read -rp "   URL [$DEFAULT_RTSP]: " RTSP_URL
-RTSP_URL="${RTSP_URL:-$DEFAULT_RTSP}"
+read -rp "   URL [$DEFAULT_RTSP_1]: " RTSP_URL_1
+RTSP_URL_1="${RTSP_URL_1:-$DEFAULT_RTSP_1}"
 
 echo ""
-echo -e "${YELLOW}2. Token do bot Telegram${NC}"
-echo "   Gerado pelo @BotFather — formato: 1234567890:ABC..."
-read -rp "   Token: " BOT_TOKEN
+echo -e "${YELLOW}2. URL da câmera 2 (RTSP)${NC}"
+echo "   Opcional — deixe em branco para desabilitar"
+read -rp "   URL [$DEFAULT_RTSP_2]: " RTSP_URL_2
+RTSP_URL_2="${RTSP_URL_2:-$DEFAULT_RTSP_2}"
 
 echo ""
-echo -e "${YELLOW}3. ID do grupo Telegram${NC}"
-echo "   Número negativo, ex: -1001234567890"
-read -rp "   Chat ID: " CHAT_ID
+echo -e "${YELLOW}3. Cloudflare R2 (upload na nuvem)${NC}"
+echo "   Opcional — deixe em branco para desabilitar"
+read -rp "   Account ID [$(_get REPLAY_R2_ACCOUNT_ID)]: " R2_ACCOUNT_ID
+R2_ACCOUNT_ID="${R2_ACCOUNT_ID:-$(_get REPLAY_R2_ACCOUNT_ID)}"
+read -rp "   Access Key ID [$(_get REPLAY_R2_ACCESS_KEY_ID)]: " R2_ACCESS_KEY_ID
+R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-$(_get REPLAY_R2_ACCESS_KEY_ID)}"
+read -rp "   Secret Access Key [$(_get REPLAY_R2_SECRET_ACCESS_KEY)]: " R2_SECRET_ACCESS_KEY
+R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-$(_get REPLAY_R2_SECRET_ACCESS_KEY)}"
+read -rp "   Bucket [$(_get REPLAY_R2_BUCKET)]: " R2_BUCKET
+R2_BUCKET="${R2_BUCKET:-$(_get REPLAY_R2_BUCKET)}"
 
-# Atualiza apenas as 3 linhas no .env existente
-sed -i \
-    -e "s|^REPLAY_CAM_1_RTSP_URL=.*|REPLAY_CAM_1_RTSP_URL=$RTSP_URL|" \
-    -e "s|^REPLAY_BOT_TOKEN=.*|REPLAY_BOT_TOKEN=$BOT_TOKEN|" \
-    -e "s|^REPLAY_CHAT_ID=.*|REPLAY_CHAT_ID=$CHAT_ID|" \
-    .env
+echo ""
+echo -e "${YELLOW}4. Backend (necessário só se R2 estiver habilitado)${NC}"
+DEFAULT_BACKEND_URL="$(_get REPLAY_BACKEND_URL)"
+read -rp "   URL [$DEFAULT_BACKEND_URL]: " BACKEND_URL
+BACKEND_URL="${BACKEND_URL:-$DEFAULT_BACKEND_URL}"
+read -rp "   API Key [$(_get REPLAY_BACKEND_API_KEY)]: " BACKEND_API_KEY
+BACKEND_API_KEY="${BACKEND_API_KEY:-$(_get REPLAY_BACKEND_API_KEY)}"
+
+_set REPLAY_CAM_1_RTSP_URL "$RTSP_URL_1"
+_set REPLAY_CAM_2_RTSP_URL "$RTSP_URL_2"
+_set REPLAY_CAM_2_BUFFER_DIR "$([ -n "$RTSP_URL_2" ] && echo "/tmp/replay_buffer_2")"
+_set REPLAY_R2_ACCOUNT_ID "$R2_ACCOUNT_ID"
+_set REPLAY_R2_ACCESS_KEY_ID "$R2_ACCESS_KEY_ID"
+_set REPLAY_R2_SECRET_ACCESS_KEY "$R2_SECRET_ACCESS_KEY"
+_set REPLAY_R2_BUCKET "$R2_BUCKET"
+_set REPLAY_BACKEND_URL "$BACKEND_URL"
+_set REPLAY_BACKEND_API_KEY "$BACKEND_API_KEY"
 
 echo ""
 echo -e "${GREEN}✓ .env salvo${NC}"
 
-# Testa câmera
-echo ""
-echo -e "${YELLOW}Testando câmera...${NC}"
-if ./ffmpeg -loglevel error -rtsp_transport tcp -i "$RTSP_URL" -t 2 -f null - 2>/dev/null; then
-    echo -e "${GREEN}✓ Câmera OK${NC}"
-else
-    echo -e "${RED}✗ Câmera não respondeu. Verifique:${NC}"
-    echo "  • IP Webcam iniciado no celular (botão 'Iniciar servidor')?"
-    echo "  • Tethering USB ativo em Configurações → Ponto de acesso?"
-    echo "  • URL correta: $RTSP_URL"
-    echo "  Teste manual: ./ffmpeg -i \"$RTSP_URL\" -t 2 -f null -"
-fi
+# Testa câmeras
+test_camera() {
+    local label="$1" url="$2"
+    echo ""
+    echo -e "${YELLOW}Testando $label...${NC}"
+    if ./ffmpeg -loglevel error -rtsp_transport tcp -i "$url" -t 2 -f null - 2>/dev/null; then
+        echo -e "${GREEN}✓ $label OK${NC}"
+    else
+        echo -e "${RED}✗ $label não respondeu. Verifique:${NC}"
+        echo "  • IP Webcam iniciado no celular (botão 'Iniciar servidor')?"
+        echo "  • Tethering USB ativo em Configurações → Ponto de acesso?"
+        echo "  • URL correta: $url"
+        echo "  Teste manual: ./ffmpeg -i \"$url\" -t 2 -f null -"
+    fi
+}
 
-# Testa Telegram
-echo ""
-echo -e "${YELLOW}Testando bot Telegram...${NC}"
-TG=$(curl -sf "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null || true)
-if echo "$TG" | grep -q '"ok":true'; then
-    BOT_NAME=$(echo "$TG" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
-    echo -e "${GREEN}✓ Bot @${BOT_NAME} conectado${NC}"
-else
-    echo -e "${RED}✗ Token inválido ou sem conexão. Verifique REPLAY_BOT_TOKEN${NC}"
-fi
+test_camera "câmera 1" "$RTSP_URL_1"
+[ -n "$RTSP_URL_2" ] && test_camera "câmera 2" "$RTSP_URL_2"
 
 echo ""
 echo "────────────────────────────────────────"

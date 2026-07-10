@@ -257,7 +257,11 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	pass2Out := outputPath
 	tempVideoPath := ""
 	if hasMusic {
-		tempVideoPath = outputPath + ".tmp.mp4"
+		// Keep the intermediate file out of "pending/": the delivery queue
+		// sweeps that dir every 30s and matches anything ending in ".mp4"
+		// (filepath.Ext only checks the last dot), so a file left there
+		// mid-pipeline could get delivered/moved before pass 3 reads it.
+		tempVideoPath = filepath.Join(e.cfg.OutputDir, filepath.Base(outputPath)+".tmp.mp4")
 		pass2Out = tempVideoPath
 		defer os.Remove(tempVideoPath)
 	}
@@ -326,16 +330,22 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	// Video is already encoded, so this pass uses stream-copy for video (fast).
 	// Mixes the clip's own audio with the music bed instead of replacing it —
 	// -shortest stops both when the video ends.
-	// ponytail: assumes the clip has an audio track (0:a); add an ffprobe
-	// presence check first if cameras without audio start using music.
 	if hasMusic {
 		e.logger.Info("applying background music", slog.String("path", e.cfg.BackgroundMusicPath))
+		// The camera clip may have no audio track at all; [0:a] would then
+		// match no stream and fail the whole filtergraph. Probe for it and
+		// fall back to using the music alone as the audio track.
+		filterComplex := "[0:a]volume=1.0[a0];[1:a]volume=0.07[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+		if !e.hasAudioStream(ctx, tempVideoPath) {
+			e.logger.Warn("clip has no audio track, using music as sole audio", slog.String("camera", e.cfg.CameraID))
+			filterComplex = "[1:a]volume=1.0[aout]"
+		}
 		pass3 := []string{
 			"-loglevel", "warning",
 			"-i", tempVideoPath,
 			"-stream_loop", "-1",
 			"-i", e.cfg.BackgroundMusicPath,
-			"-filter_complex", "[0:a]volume=1.0[a0];[1:a]volume=0.07[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+			"-filter_complex", filterComplex,
 			"-map", "0:v",
 			"-map", "[aout]",
 			"-c:v", "copy",
@@ -351,4 +361,20 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	}
 
 	return nil
+}
+
+// hasAudioStream uses ffmpeg to probe the file and returns true if it contains at least one audio stream.
+// It relies on e.cfg.FFmpegBin instead of ffprobe, as only the ffmpeg binary is guaranteed to be bundled.
+func (e *Engine) hasAudioStream(ctx context.Context, path string) bool {
+	cmd := exec.CommandContext(ctx, e.cfg.FFmpegBin, "-i", path)
+	out, _ := cmd.CombinedOutput()
+	outStr := string(out)
+	for _, line := range strings.Split(outStr, "\n") {
+		// Look for a stream definition, e.g.:
+		//   Stream #0:1(und): Audio: aac (LC)...
+		if strings.Contains(line, "Stream #") && strings.Contains(line, "Audio:") {
+			return true
+		}
+	}
+	return false
 }
