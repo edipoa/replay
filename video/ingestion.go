@@ -77,6 +77,12 @@ func (e *Engine) runIngestion(ctx context.Context) {
 func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 	segPath := filepath.Join(e.cfg.BufferDir, segmentFilePattern)
 
+	// procCtx lets the stall watchdog kill FFmpeg on its own, independent of
+	// the outer shutdown context, so the normal exit/backoff/reconnect path
+	// below handles it exactly like any other FFmpeg crash.
+	procCtx, killFFmpeg := context.WithCancel(ctx)
+	defer killFFmpeg()
+
 	args := []string{
 		"-loglevel", "warning",
 		"-rtsp_transport", "tcp",
@@ -97,7 +103,7 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 		segPath,
 	}
 
-	cmd := exec.CommandContext(ctx, e.cfg.FFmpegBin, args...)
+	cmd := exec.CommandContext(procCtx, e.cfg.FFmpegBin, args...)
 	// Force UTC so -strftime filenames match the UTC wall clock used everywhere else.
 	cmd.Env = append(os.Environ(), "TZ=UTC")
 
@@ -131,7 +137,78 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 		}
 	}()
 
+	go e.watchForStall(procCtx, killFFmpeg)
+
 	return cmd.Wait()
+}
+
+// watchForStall kills FFmpeg if no new segment file has appeared in BufferDir
+// for stallThreshold. FFmpeg can wedge on malformed camera timestamps (e.g.
+// "Non-monotonic DTS") and stop rotating segments without ever exiting or
+// logging an error — invisible to the normal exit-based reconnect logic,
+// while the cleanup ticker keeps deleting the aging segment until the buffer
+// dir is permanently empty.
+func (e *Engine) watchForStall(ctx context.Context, kill context.CancelFunc) {
+	threshold := max(3*time.Duration(e.cfg.SegmentTime)*time.Second, 10*time.Second)
+	e.watchForStallEvery(ctx, kill, threshold, cleanupInterval)
+}
+
+// watchForStallEvery is watchForStall with threshold/checkInterval as
+// parameters so the decision logic can be exercised in tests without
+// waiting on real timers.
+func (e *Engine) watchForStallEvery(ctx context.Context, kill context.CancelFunc, threshold, checkInterval time.Duration) {
+	log := e.logger.With(slog.String("component", "ingestion"))
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	start := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			newest, ok := e.newestSegmentTime()
+			if isStalled(time.Now(), start, newest, ok, threshold) {
+				log.Error("segment output stalled – killing FFmpeg",
+					slog.Bool("ever_produced_segment", ok),
+					slog.Duration("threshold", threshold),
+				)
+				kill()
+				return
+			}
+		}
+	}
+}
+
+// isStalled reports whether ingestion should be considered wedged: either no
+// segment has ever appeared within threshold of start, or the newest segment
+// is older than threshold (FFmpeg stopped rotating but didn't exit).
+func isStalled(now, start, newest time.Time, hasSegments bool, threshold time.Duration) bool {
+	if !hasSegments {
+		return now.Sub(start) > threshold
+	}
+	return now.Sub(newest) > threshold
+}
+
+// newestSegmentTime returns the most recent segment start time found in
+// BufferDir, or ok=false if the directory has no valid segment files yet.
+func (e *Engine) newestSegmentTime() (newest time.Time, ok bool) {
+	entries, err := os.ReadDir(e.cfg.BufferDir)
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".ts" {
+			continue
+		}
+		segTime, err := parseSegmentTime(entry.Name())
+		if err != nil || segTime.Before(newest) {
+			continue
+		}
+		newest, ok = segTime, true
+	}
+	return newest, ok
 }
 
 // ─── Cleanup Ticker ───────────────────────────────────────────────────────────

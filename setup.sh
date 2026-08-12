@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
+touch .env
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
@@ -21,11 +22,15 @@ _set() {
         local esc_val; esc_val="$(printf '%s' "$val" | sed -e 's/[\&|]/\\&/g')"
         if grep -q "^$key=" .env; then
             sed -i "s|^$key=.*|$key=$esc_val|" .env
-        else
+        elif grep -q "^#\? *$key=" .env; then
             sed -i "s|^#\? *$key=.*|$key=$esc_val|" .env
+        else
+            echo "$key=$esc_val" >> .env
         fi
     else
-        sed -i "s|^$key=.*|# $key=|" .env
+        if grep -q "^$key=" .env; then
+            sed -i "s|^$key=.*|# $key=|" .env
+        fi
     fi
 }
 

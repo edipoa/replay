@@ -59,6 +59,19 @@ func (e *Engine) GenerateReplay(ctx context.Context, triggerTime time.Time) (str
 		slog.Time("window_end", windowEnd),
 	)
 
+	// Ingestion writes segment filenames using wall-clock time at the moment
+	// FFmpeg opens each file, so a wedged/backlogged FFmpeg (see watchForStall)
+	// can still be rotating files while lagging behind real time. If the
+	// newest segment on disk doesn't even reach this trigger's own window end,
+	// the clip we're about to build is likely to contain stale footage — flag
+	// it loudly instead of only surfacing as "wrong video" on the site.
+	if newest, ok := e.newestSegmentTime(); ok && newest.Before(windowEnd) {
+		log.Warn("ingestion appears behind — clip may contain stale footage",
+			slog.Time("newest_segment", newest),
+			slog.Duration("lag", windowEnd.Sub(newest)),
+		)
+	}
+
 	segments, err := e.collectSegments(windowStart, windowEnd)
 	if err != nil {
 		return "", fmt.Errorf("collect segments: %w", err)
@@ -114,7 +127,10 @@ func (e *Engine) GeneratePreview(ctx context.Context, mp4Path, outputPath string
 	return e.runFFmpegPass(ctx, "gif encode", []string{
 		"-loglevel", "warning",
 		"-i", mp4Path,
-		"-vf", "fps=5,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+		// flags=fast_bilinear: lanczos is noticeably heavier on the low-power
+		// deploy hardware (2011 iMac, i5-2400S) for a barely-visible gain on a
+		// small preview GIF.
+		"-vf", "fps=5,scale=640:-1:flags=fast_bilinear,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
 		"-y",
 		outputPath,
 	})

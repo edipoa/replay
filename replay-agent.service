@@ -1,0 +1,18 @@
+[Unit]
+Description=Replay Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ajuste WorkingDirectory/ExecStart/User para o path e usuário reais de deploy.
+WorkingDirectory=/home/replay/replay-agent
+ExecStart=/home/replay/replay-agent/start.sh
+Restart=always
+RestartSec=2
+# User precisa pertencer ao grupo "input" (sudo usermod -aG input <user>)
+# para ler /dev/input/js{id} sem rodar como root.
+User=replay
+
+[Install]
+WantedBy=multi-user.target

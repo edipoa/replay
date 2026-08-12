@@ -299,7 +299,7 @@ func run(logger *slog.Logger) error {
 		)
 	} else {
 		go func() {
-			listenerDone <- runJoystickListener(ctx, cfg.JoystickID, debounce, onPress)
+			listenerDone <- runJoystickListener(ctx, cfg.JoystickID, debounce, onPress, logger)
 		}()
 		logger.Info("replay agent ready",
 			slog.Int("joystick_id", cfg.JoystickID),
@@ -358,16 +358,38 @@ func runReplay(
 
 	if uploader != nil {
 		videoID := upload.NewID()
-		r2Key, err := uploader.Upload(ctx, replayPath, videoID)
-		if err != nil {
-			log.Error("replay: r2 upload failed", slog.Any("error", err))
+		previewPath := replayPath + ".preview.gif"
+		// GeneratePreview may or may not have written the file depending on
+		// uploadErr/previewErr below; always try to clean it up so a failed
+		// R2 upload doesn't leave the gif orphaned in pending/ forever (only
+		// .mp4 files are swept out of pending/ by the delivery queue).
+		defer func() { _ = os.Remove(previewPath) }()
+
+		// GIF generation only reads the local file — it doesn't depend on the
+		// upload result — so run it concurrently with the (network-bound) R2
+		// upload instead of waiting for the upload to finish first.
+		var r2Key string
+		var uploadErr, previewErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			r2Key, uploadErr = uploader.Upload(ctx, replayPath, videoID)
+		}()
+		go func() {
+			defer wg.Done()
+			previewErr = eng.GeneratePreview(ctx, replayPath, previewPath)
+		}()
+		wg.Wait()
+
+		if uploadErr != nil {
+			log.Error("replay: r2 upload failed", slog.Any("error", uploadErr))
 		} else {
 			log.Info("replay: uploaded to r2", slog.String("key", r2Key))
 
 			var thumbnailKey string
-			previewPath := replayPath + ".preview.gif"
-			if err := eng.GeneratePreview(ctx, replayPath, previewPath); err != nil {
-				log.Warn("replay: preview generation failed", slog.Any("error", err))
+			if previewErr != nil {
+				log.Warn("replay: preview generation failed", slog.Any("error", previewErr))
 			} else {
 				if key, err := uploader.UploadPreview(ctx, previewPath, videoID); err != nil {
 					log.Warn("replay: preview upload failed", slog.Any("error", err))
@@ -375,7 +397,6 @@ func runReplay(
 					thumbnailKey = key
 					log.Info("replay: preview uploaded", slog.String("key", key))
 				}
-				_ = os.Remove(previewPath)
 			}
 
 			meta := upload.VideoMeta{
@@ -422,23 +443,62 @@ func (db *debouncer) Allow() (time.Time, bool) {
 
 // ─── Joystick listener ────────────────────────────────────────────────────────
 
+// joystickRetryInterval is how long runJoystickListener waits before
+// retrying after the device is missing or disconnects — e.g. a loose USB
+// cable on the arcade button. A missing joystick must never bring down
+// camera capture and delivery, so this loop retries forever instead of
+// returning an error that would kill the whole process.
+const joystickRetryInterval = 2 * time.Second
+
 // runJoystickListener polls a USB joystick/gamepad every 20 ms and calls
 // onPress on every button press outside the debounce window.
 // Works on Linux (/dev/input/js{id}) and Windows (winmm.dll joyGetPosEx).
+//
+// If the device is absent or disconnects mid-run, it logs once and keeps
+// retrying until ctx is cancelled — it only ever returns nil.
 func runJoystickListener(
 	ctx context.Context,
 	joystickID int,
 	d time.Duration,
 	onPress func(time.Time),
+	logger *slog.Logger,
 ) error {
-	js, err := joystick.Open(joystickID)
-	if err != nil {
-		return fmt.Errorf("open joystick %d: %w", joystickID, err)
-	}
-	defer js.Close()
-
-	var prevButtons uint32
 	db := debouncer{d: d}
+	warned := false
+
+	for {
+		js, err := joystick.Open(joystickID)
+		if err != nil {
+			if !warned {
+				logger.Warn("joystick not found, will keep retrying",
+					slog.Int("joystick_id", joystickID), slog.Any("error", err))
+				warned = true
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(joystickRetryInterval):
+				continue
+			}
+		}
+		if warned {
+			logger.Info("joystick connected", slog.Int("joystick_id", joystickID))
+			warned = false
+		}
+
+		err = pollJoystick(ctx, js, &db, onPress)
+		js.Close()
+		if err == nil {
+			return nil // ctx cancelled
+		}
+		logger.Warn("joystick disconnected, will retry", slog.Any("error", err))
+	}
+}
+
+// pollJoystick reads button state every 20 ms until ctx is cancelled (nil)
+// or the device errors out, e.g. unplugged (non-nil).
+func pollJoystick(ctx context.Context, js *joystick.Joystick, db *debouncer, onPress func(time.Time)) error {
+	var prevButtons uint32
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -449,10 +509,7 @@ func runJoystickListener(
 		case <-ticker.C:
 			buttons, err := js.Poll()
 			if err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				return fmt.Errorf("read joystick: %w", err)
+				return err
 			}
 
 			// Detect 0→1 transitions (press, not hold).
