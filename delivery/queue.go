@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/edipo/replay-saas/internal/obs"
 )
 
 const (
@@ -34,9 +36,9 @@ func Lock(path string) func() {
 // tick removes delivered files older than 24 h.
 // It blocks until ctx is cancelled.
 func RunQueueWorker(ctx context.Context, outputDir string, bot *Bot, logger *slog.Logger) {
-	pendingDir   := filepath.Join(outputDir, "pending")
+	pendingDir := filepath.Join(outputDir, "pending")
 	deliveredDir := filepath.Join(outputDir, "delivered")
-	orphanedDir  := filepath.Join(outputDir, "orphaned")
+	orphanedDir := filepath.Join(outputDir, "orphaned")
 
 	deliveryTick := time.NewTicker(deliveryTickInterval)
 	cleanupTick := time.NewTicker(cleanupTickInterval)
@@ -106,16 +108,21 @@ func processPending(ctx context.Context, pendingDir, deliveredDir, orphanedDir s
 				} else {
 					logger.Warn("queue: no slot found, moved to orphaned",
 						slog.String("file", entry.Name()))
+					obs.Event(obs.Warn, "deliver.orphaned", "", "clipe sem horário correspondente na agenda — movido pra orphaned/",
+						slog.String("file", entry.Name()))
 				}
 			} else {
 				logger.Warn("queue: delivery failed, will retry next tick",
 					slog.String("file", entry.Name()),
 					slog.Any("error", err))
+				obs.Event(obs.Critical, "deliver.failed", "", "envio do clipe pro Telegram falhou — vai tentar de novo",
+					slog.String("file", entry.Name()), slog.Any("error", err))
 			}
 			continue
 		}
 
 		logger.Info("queue: delivered", slog.String("file", entry.Name()))
+		obs.Event(obs.Info, "deliver.ok", "", "clipe entregue no Telegram", slog.String("file", entry.Name()))
 		_ = os.Rename(srcPath, dstPath)
 	}
 }

@@ -17,7 +17,7 @@ HOST        ?=
 DEPLOY_USER ?=
 REMOTE_PATH ?= /home/$(DEPLOY_USER)/replay-agent
 
-.PHONY: dist dist-linux dist-windows clean seed seed-dry deploy
+.PHONY: dist dist-linux dist-windows clean seed seed-dry deploy status
 
 dist: dist-linux dist-windows
 
@@ -74,6 +74,10 @@ deploy:
 	rsync -a --exclude='.env' $(DIST)/linux/ $(DEPLOY_USER)@$(HOST):$(REMOTE_PATH)/
 	ssh $(DEPLOY_USER)@$(HOST) "sudo systemctl restart replay-agent"
 	@echo "✅  Deploy concluído — replay-agent reiniciado em $(HOST)"
+
+status: ## Puxa o status ao vivo do agente no campo. Ex: make status HOST=192.168.x.x [PORT=8088]
+	@test -n "$(HOST)" || (echo "❌ Uso: make status HOST=192.168.x.x [PORT=8088]" && exit 1)
+	@curl -s http://$(HOST):$(or $(PORT),8088)/status | (jq . 2>/dev/null || cat)
 
 clean:
 	rm -rf $(DIST)/

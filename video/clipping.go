@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/edipo/replay-saas/internal/obs"
 )
 
 // ─── Clipping Engine ──────────────────────────────────────────────────────────
@@ -70,6 +72,9 @@ func (e *Engine) GenerateReplay(ctx context.Context, triggerTime time.Time) (str
 			slog.Time("newest_segment", newest),
 			slog.Duration("lag", windowEnd.Sub(newest)),
 		)
+		obs.Event(obs.Warn, "ingest.behind", e.cfg.CameraID,
+			"ingestão atrasada no momento do clipe — footage pode estar velha",
+			slog.Duration("lag", windowEnd.Sub(newest)))
 	}
 
 	segments, err := e.collectSegments(windowStart, windowEnd)
@@ -306,27 +311,28 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	// Build the video portion of the filter graph.
 	// watermark → bottom-left  (10:H-h-10)
 	// logo      → bottom-right (W-w-10:H-h-10)
+	sc := fmt.Sprintf("scale=%d:-2", e.cfg.ClipWidth)
 	switch {
 	case hasWatermark && hasLogo:
 		pass2 = append(pass2,
-			"-filter_complex", "[0:v]scale=1280:-2[sc];[2:v]scale=80:-1[logo];[sc][1:v]overlay=10:H-h-10[wm];[wm][logo]overlay=W-w-10:H-h-10[outv]",
+			"-filter_complex", "[0:v]"+sc+"[sc];[2:v]scale=80:-1[logo];[sc][1:v]overlay=10:H-h-10[wm];[wm][logo]overlay=W-w-10:H-h-10[outv]",
 			"-map", "[outv]",
 			"-map", "0:a?",
 		)
 	case hasWatermark:
 		pass2 = append(pass2,
-			"-filter_complex", "[0:v]scale=1280:-2[sc];[sc][1:v]overlay=10:H-h-10[outv]",
+			"-filter_complex", "[0:v]"+sc+"[sc];[sc][1:v]overlay=10:H-h-10[outv]",
 			"-map", "[outv]",
 			"-map", "0:a?",
 		)
 	case hasLogo:
 		pass2 = append(pass2,
-			"-filter_complex", "[0:v]scale=1280:-2[sc];[1:v]scale=80:-1[logo];[sc][logo]overlay=W-w-10:H-h-10[outv]",
+			"-filter_complex", "[0:v]"+sc+"[sc];[1:v]scale=80:-1[logo];[sc][logo]overlay=W-w-10:H-h-10[outv]",
 			"-map", "[outv]",
 			"-map", "0:a?",
 		)
 	default:
-		pass2 = append(pass2, "-vf", "scale=1280:-2")
+		pass2 = append(pass2, "-vf", sc)
 	}
 
 	pass2 = append(pass2,

@@ -193,6 +193,64 @@ Acompanhar logs ao vivo (equivalente a "olhar o terminal" do fluxo antigo):
 journalctl -u replay-agent -f
 ```
 
+**Painel de status ao vivo** (mais palpável que o journald): abra no navegador
+do celular, na mesma LAN:
+
+```
+http://<ip-do-notebook>:8088/
+```
+
+Mostra câmeras up/down, idade do buffer, USB do botão, clipes hoje, falhas,
+disco livre e alertas ativos — atualiza sozinho a cada 10s. Da sua máquina:
+
+```bash
+make status HOST=<ip-do-notebook>
+curl -s http://<ip-do-notebook>:8088/events?limit=30 | jq   # timeline de eventos
+```
+
+Alertas críticos (câmera caída, ingestão travada, USB do botão desconectado,
+clipe/entrega falhando) chegam sozinhos no Telegram, com mensagem de
+"recuperado" quando volta.
+
+**Botão digital de emergência** (`/botao`): se o botão físico falhar no meio do
+jogo, qualquer celular abre uma página com um botão gigante que dispara o
+replay igual ao físico.
+
+- Na LAN: `http://<ip-do-notebook>:8088/botao`.
+- Pela internet: `botao.vianasociety.com.br` (ver abaixo).
+
+Fica aberto (sem PIN) por padrão — pra uma solução temporária de dia de jogo
+tá ok: o `onPress` descarta re-press <15s e a fila tem cap 1, então o pior caso
+de alguém achar a URL é um clipe extra de vez em quando. Se quiser um PIN,
+defina `REPLAY_TRIGGER_TOKEN` no `.env` (digitado uma vez, fica salvo no
+celular).
+
+O notebook já tem um tunnel `cloudflared` (`/etc/cloudflared/config.yml`,
+domínio `vianasociety.com.br`) servindo `replay.vianasociety.com.br` (painel,
+atrás do Cloudflare Access). Pra publicar `botao.vianasociety.com.br`:
+
+```bash
+# 1. rota DNS pro mesmo tunnel
+cloudflared tunnel route dns <nome-ou-id-do-tunnel> botao.vianasociety.com.br
+
+# 2. adicione o hostname no ingress do /etc/cloudflared/config.yml,
+#    ANTES da regra catch-all:
+#   ingress:
+#     - hostname: replay.vianasociety.com.br
+#       service: http://localhost:8088
+#     - hostname: botao.vianasociety.com.br
+#       service: http://localhost:8088
+#     - service: http_status:404
+
+sudo systemctl restart cloudflared
+```
+
+**Importante:** `botao.vianasociety.com.br` NÃO pode ficar atrás do Cloudflare
+Access — o pessoal no local precisa abrir direto no celular. O painel `/` e
+`/events` também respondem nesse hostname; se algum dia quiser fechar o botão,
+é o `REPLAY_TRIGGER_TOKEN` que faz isso (só o `POST /trigger` valida o PIN; a
+página `/botao` só pede e repassa).
+
 ---
 
 ### 5. Testar antes do jogo começar
@@ -218,6 +276,20 @@ journalctl -u replay-agent -f
 
 Desativar o Tethering USB no celular.
 
+### Puxar o log do jogo pra investigar depois
+
+Todo evento fica gravado num SQLite local (`<REPLAY_OUTPUT_DIR>/replay.db`,
+retido 30 dias). Pra reconstruir o que aconteceu:
+
+```bash
+scp <user>@<ip-do-notebook>:<REPLAY_OUTPUT_DIR>/replay.db .
+sqlite3 replay.db \
+  "select ts,level,kind,camera,msg from events order by id desc limit 100"
+# só os problemas:
+sqlite3 replay.db \
+  "select ts,kind,camera,msg from events where level='critical' order by id"
+```
+
 Não é preciso reverter a configuração de suspensão (`logind.conf` / masks
 de systemd) — é setup de máquina, feito uma vez só, permanece assim entre
 jogos.
@@ -233,3 +305,6 @@ jogos.
 | Botão do joystick não gera replay | Usuário do serviço está no grupo `input`? `groups replay` |
 | Replay não chega no Telegram | `agenda.json` tem o horário de hoje? Ver `/tmp/telegram.log` |
 | `usb0` não aparece | Desativar e reativar Tethering USB no celular |
+| "Apertou mas não saiu clipe" | Abrir `http://<ip>:8088/` — ver se câmera está `up`, USB `ok`, e procurar o press em `/events` (pode ter sido `button.debounced` ou `button.repress_dropped`) |
+| Clipe não chegou no site/R2 | Normal se a internet estiver ruim — fica na fila de retry (`<OUTPUT_DIR>/r2_queue/*.json`) e sobe sozinho quando a banda voltar. Alerta `upload.stuck` no Telegram só se passar de 30min. `ls <OUTPUT_DIR>/r2_queue/` mostra o que está pendente |
+| Página `:8088` não abre | Notebook e celular na mesma rede? `REPLAY_HTTP_ADDR` no `.env`? `systemctl status replay-agent` |

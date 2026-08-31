@@ -9,16 +9,19 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	telegramSendVideo = "https://api.telegram.org/bot%s/sendVideo"
+	telegramSendVideo   = "https://api.telegram.org/bot%s/sendVideo"
+	telegramSendMessage = "https://api.telegram.org/bot%s/sendMessage"
 
 	// maxRetries is how many times UploadVideo will attempt the upload before
 	// giving up and returning an error to the caller.
@@ -180,6 +183,35 @@ func (b *Bot) UploadVideo(ctx context.Context, filePath string, threadID int64) 
 	}
 
 	return fmt.Errorf("upload failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// ─── Plain text messages (used by the observability alerter) ──────────────────
+
+// SendText posts a plain-text message to the bot's chat. Pass 0 for threadID to
+// send to the group's main feed. Single attempt — the caller (obs alerter)
+// handles its own retry and the event is already durable in SQLite.
+func (b *Bot) SendText(ctx context.Context, text string, threadID int64) error {
+	form := url.Values{}
+	form.Set("chat_id", b.cfg.ChatID)
+	form.Set("text", text)
+	if threadID != 0 {
+		form.Set("message_thread_id", strconv.FormatInt(threadID, 10))
+	}
+
+	apiURL := fmt.Sprintf(telegramSendMessage, b.cfg.BotToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return parseTelegramResponse(resp)
 }
 
 // ─── Single-attempt upload ────────────────────────────────────────────────────

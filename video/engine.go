@@ -85,6 +85,11 @@ type Config struct {
 	// CameraID is a short label embedded in output filenames (e.g. "cam1").
 	// Default: "cam1"
 	CameraID string
+
+	// ClipWidth is the output width (px) of the final encoded clip; height
+	// scales to keep aspect. Lower it on thin-uplink venues to shrink the file.
+	// Default: 1280 (720p)
+	ClipWidth int
 }
 
 func (c *Config) applyDefaults() {
@@ -117,6 +122,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CameraID == "" {
 		c.CameraID = "cam1"
+	}
+	if c.ClipWidth == 0 {
+		c.ClipWidth = 1280
 	}
 }
 

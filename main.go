@@ -19,6 +19,7 @@ import (
 	"github.com/edipo/replay-saas/delivery"
 	"github.com/edipo/replay-saas/internal/envutil"
 	"github.com/edipo/replay-saas/internal/joystick"
+	"github.com/edipo/replay-saas/internal/obs"
 	"github.com/edipo/replay-saas/internal/selftest"
 	"github.com/edipo/replay-saas/upload"
 	"github.com/edipo/replay-saas/video"
@@ -37,6 +38,7 @@ type appConfig struct {
 	Cameras     []cameraConfig
 	OutputDir   string
 	SegmentTime int
+	ClipWidth   int
 
 	// Delivery
 	BotToken            string
@@ -51,6 +53,10 @@ type appConfig struct {
 	JoystickID int // index of the USB joystick (0 = first device)
 	DebounceMs int
 
+	// Observability
+	HTTPAddr      string // status server listen addr (":8088")
+	AlertThreadID int    // Telegram message_thread_id for critical alerts (0 = main feed)
+
 	// Dev/test
 	Simulate bool
 }
@@ -59,16 +65,19 @@ func loadConfig() (appConfig, error) {
 	simulate := os.Getenv("REPLAY_SIMULATE") == "true"
 
 	cfg := appConfig{
-		OutputDir:       envutil.Or("REPLAY_OUTPUT_DIR", "/tmp/replays"),
-		SegmentTime:     envutil.IntOr("REPLAY_SEGMENT_TIME_S", 2),
-		AgendaPath:      envutil.Or("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
-		TelegramLogPath: envutil.Or("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
+		OutputDir:           envutil.Or("REPLAY_OUTPUT_DIR", "/tmp/replays"),
+		SegmentTime:         envutil.IntOr("REPLAY_SEGMENT_TIME_S", 2),
+		ClipWidth:           envutil.IntOr("REPLAY_CLIP_WIDTH", 1280),
+		AgendaPath:          envutil.Or("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
+		TelegramLogPath:     envutil.Or("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
 		WatermarkPath:       envutil.Or("REPLAY_WATERMARK_PATH", "watermark.png"),
 		LogoPath:            envutil.Or("REPLAY_LOGO_PATH", "logo.png"),
 		BackgroundMusicPath: os.Getenv("REPLAY_MUSIC_PATH"),
-		JoystickID:      envutil.IntOr("REPLAY_JOYSTICK_ID", 0),
-		DebounceMs:      envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
-		Simulate:        simulate,
+		JoystickID:          envutil.IntOr("REPLAY_JOYSTICK_ID", 0),
+		DebounceMs:          envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
+		HTTPAddr:            envutil.Or("REPLAY_HTTP_ADDR", ":8088"),
+		AlertThreadID:       envutil.IntOr("REPLAY_ALERT_THREAD_ID", 0),
+		Simulate:            simulate,
 	}
 
 	// ── Camera discovery ──────────────────────────────────────────────────────
@@ -106,6 +115,10 @@ func loadConfig() (appConfig, error) {
 
 	cfg.BotToken = os.Getenv("REPLAY_BOT_TOKEN")
 	cfg.ChatID = os.Getenv("REPLAY_CHAT_ID")
+
+	if s := envutil.IntOr("REPLAY_UPLOAD_TIMEOUT_S", 0); s > 0 {
+		uploadTimeout = time.Duration(s) * time.Second
+	}
 
 	return cfg, nil
 }
@@ -150,6 +163,7 @@ func run(logger *slog.Logger) error {
 			BufferDir:           cam.BufferDir,
 			OutputDir:           cfg.OutputDir,
 			SegmentTime:         cfg.SegmentTime,
+			ClipWidth:           cfg.ClipWidth,
 			FFmpegBin:           ffmpegBin,
 			WatermarkPath:       cfg.WatermarkPath,
 			LogoPath:            cfg.LogoPath,
@@ -173,6 +187,10 @@ func run(logger *slog.Logger) error {
 		Level: slog.LevelInfo,
 	}))
 
+	// The Telegram bot is used for two independent things:
+	//   - operational alerts (obs layer) — on whenever a token+chat are set
+	//   - per-slot clip delivery — opt-in via REPLAY_TELEGRAM_CLIPS=true
+	// Clips now go to R2/replay-site, so clip delivery defaults off.
 	var bot *delivery.Bot
 	if cfg.BotToken != "" && cfg.ChatID != "" {
 		b, err := delivery.New(delivery.Config{
@@ -184,10 +202,12 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("delivery bot: %w", err)
 		}
 		bot = b
-		logger.Info("telegram delivery enabled")
+		logger.Info("telegram bot enabled (alerts)")
 	} else {
-		logger.Warn("telegram delivery disabled (REPLAY_BOT_TOKEN/REPLAY_CHAT_ID not set)")
+		logger.Warn("telegram disabled (REPLAY_BOT_TOKEN/REPLAY_CHAT_ID not set) — no alerts")
 	}
+
+	telegramClips := os.Getenv("REPLAY_TELEGRAM_CLIPS") == "true"
 
 	// ── 5. Upload client (optional — only when R2 vars are set) ──────────────
 	var uploader *upload.Client
@@ -206,6 +226,36 @@ func run(logger *slog.Logger) error {
 		uploader = u
 		logger.Info("r2 upload enabled", slog.String("bucket", os.Getenv("REPLAY_R2_BUCKET")))
 	}
+	emitObs := func(level, kind, camera, msg string, kv ...any) {
+		obs.Event(obs.Level(level), kind, camera, msg, kv...)
+	}
+
+	// ── 5b. Observability (SQLite event log + /status HTTP + Telegram alerts) ─
+	bufferDirs := make(map[string]string, len(cfg.Cameras))
+	for _, cam := range cfg.Cameras {
+		bufferDirs[cam.ID] = cam.BufferDir
+	}
+	obsCfg := obs.Config{
+		DBPath:        filepath.Join(cfg.OutputDir, "replay.db"),
+		HTTPAddr:      cfg.HTTPAddr,
+		AlertThread:   int64(cfg.AlertThreadID),
+		BufferDirs:    bufferDirs,
+		NewestSegment: video.NewestSegmentTime,
+		TriggerToken:  os.Getenv("REPLAY_TRIGGER_TOKEN"),
+	}
+	if bot != nil {
+		obsCfg.Bot = bot // only assign non-nil — a typed nil in the interface would panic on send
+	}
+	rec, err := obs.New(obsCfg)
+	if err != nil {
+		return fmt.Errorf("observability: %w", err)
+	}
+	obs.SetDefault(rec)
+	defer rec.Close()
+	logger.Info("observability enabled",
+		slog.String("db", obsCfg.DBPath),
+		slog.String("http_addr", cfg.HTTPAddr),
+	)
 
 	// ── 6. Context + signal handling ─────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,6 +263,11 @@ func run(logger *slog.Logger) error {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go rec.ServeHTTP(ctx)
+	go rec.RunHeartbeat(ctx)
+	obs.Event(obs.Info, "agent.started", "", "replay-agent iniciado",
+		"cameras", len(cfg.Cameras), "simulate", cfg.Simulate)
 
 	// ── 6. Start video ingestion ──────────────────────────────────────────────
 	for i, eng := range engines {
@@ -225,7 +280,23 @@ func run(logger *slog.Logger) error {
 	}
 
 	// ── 6b. Start delivery queue worker ──────────────────────────────────────
-	go delivery.RunQueueWorker(ctx, cfg.OutputDir, bot, telegramLogger)
+	// nil bot → the worker just moves clips pending/→delivered/ (R2 already has
+	// them); it only posts to Telegram when clip delivery is explicitly enabled.
+	queueBot := bot
+	if !telegramClips {
+		queueBot = nil
+	} else {
+		logger.Info("telegram clip delivery enabled")
+	}
+	go delivery.RunQueueWorker(ctx, cfg.OutputDir, queueBot, telegramLogger)
+
+	// Persistent R2 retry queue: clips whose live upload didn't fully land are
+	// finished here whenever the uplink recovers, across restarts.
+	if uploader != nil {
+		deliveredDir := filepath.Join(cfg.OutputDir, "delivered")
+		go upload.RunRetryQueue(ctx, uploader, upload.QueueDir(cfg.OutputDir), deliveredDir,
+			uploadTimeout, &uploadMu, emitObs, logger)
+	}
 
 	// ── 7. Button press handler ───────────────────────────────────────────────
 	//
@@ -237,12 +308,18 @@ func run(logger *slog.Logger) error {
 		replayActive  atomic.Bool
 		lastTriggerNs atomic.Int64
 		pressQueue    = make(chan time.Time, 1)
+		replayWG      sync.WaitGroup
 	)
 
-	onPress := func(triggerTime time.Time) {
+	// source is "físico" (joystick), "simulate" (stdin) or "web" (status page).
+	onPress := func(triggerTime time.Time, source string) {
 		if replayActive.CompareAndSwap(false, true) {
+			obs.Event(obs.Info, "button.press", "", "botão apertado — gerando replay",
+				slog.Time("trigger", triggerTime), slog.String("source", source))
 			lastTriggerNs.Store(triggerTime.UnixNano())
+			replayWG.Add(1)
 			go func() {
+				defer replayWG.Done()
 				t := triggerTime
 				for {
 					// Fire all cameras concurrently; wait for all before
@@ -252,7 +329,7 @@ func run(logger *slog.Logger) error {
 						wg.Add(1)
 						go func(e *video.Engine, camID string) {
 							defer wg.Done()
-							runReplay(ctx, e, camID, uploader, logger, t)
+							runReplay(ctx, e, camID, uploader, cfg.OutputDir, logger, t)
 						}(eng, cfg.Cameras[i].ID)
 					}
 					wg.Wait()
@@ -275,15 +352,35 @@ func run(logger *slog.Logger) error {
 
 		since := triggerTime.Sub(time.Unix(0, lastTriggerNs.Load()))
 		if since < 15*time.Second {
+			obs.Event(obs.Info, "button.repress_dropped", "", "press ignorado (re-press <15s de um replay em andamento)",
+				slog.Duration("since_last", since), slog.String("source", source))
 			return
 		}
 		select {
 		case pressQueue <- triggerTime:
+			obs.Event(obs.Info, "button.press", "", "botão apertado — clipe na fila pra próxima geração",
+				slog.Time("trigger", triggerTime), slog.Bool("queued", true), slog.String("source", source))
 			logger.Info("clip queued for next generation", slog.Time("trigger", triggerTime))
 		default:
+			obs.Event(obs.Warn, "button.repress_dropped", "", "press ignorado (fila cheia, replay em andamento)",
+				slog.Time("trigger", triggerTime), slog.String("source", source))
 			logger.Warn("press queue full, ignoring", slog.Time("trigger", triggerTime))
 		}
 	}
+
+	// Adapters so the joystick/stdin listeners (which take func(time.Time)) and
+	// the status page's POST /trigger all route through the same onPress.
+	physicalSource := "físico"
+	if cfg.Simulate {
+		physicalSource = "simulate"
+	}
+	listenerPress := func(t time.Time) { onPress(t, physicalSource) }
+	rec.SetTrigger(func(t time.Time) {
+		if ctx.Err() != nil {
+			return // agent shutting down — don't touch replayWG after cancel
+		}
+		onPress(t, "web")
+	})
 
 	// ── 8. Input listener goroutine ───────────────────────────────────────────
 	debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
@@ -291,7 +388,7 @@ func run(logger *slog.Logger) error {
 
 	if cfg.Simulate {
 		go func() {
-			listenerDone <- runStdinListener(ctx, debounce, onPress)
+			listenerDone <- runStdinListener(ctx, debounce, listenerPress)
 		}()
 		logger.Info("replay agent ready (simulate)",
 			slog.String("trigger", "press Enter"),
@@ -299,7 +396,7 @@ func run(logger *slog.Logger) error {
 		)
 	} else {
 		go func() {
-			listenerDone <- runJoystickListener(ctx, cfg.JoystickID, debounce, onPress, logger)
+			listenerDone <- runJoystickListener(ctx, cfg.JoystickID, debounce, listenerPress, logger)
 		}()
 		logger.Info("replay agent ready",
 			slog.Int("joystick_id", cfg.JoystickID),
@@ -318,15 +415,34 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info("shutting down…")
+	obs.Event(obs.Info, "agent.stopped", "", "replay-agent encerrando")
 	cancel()
 	for _, eng := range engines {
 		eng.Wait()
 	}
+	// Let any in-flight replay (already past clip generation, now uploading to
+	// R2) finish instead of abandoning it mid-upload — that upload runs on its
+	// own bounded-timeout context (see runReplay), not the cancelled ctx above,
+	// so it can actually complete instead of failing with "context canceled".
+	replayWG.Wait()
 	logger.Info("shutdown complete")
 	return nil
 }
 
 // ─── Replay orchestration ─────────────────────────────────────────────────────
+
+// uploadTimeout bounds R2 upload/preview/notify so they can outlive a
+// shutdown signal (see runReplay) without hanging forever on a dead network.
+// Sized to give upload.Client's internal retry-with-backoff room to finish
+// under the venue's slow uplink — two camera clips upload concurrently and
+// share it, so 2 min was routinely too tight ("context deadline exceeded").
+// Overridable with REPLAY_UPLOAD_TIMEOUT_S. Shutdown waits at most this long
+// for an in-flight upload (replayWG.Wait), so don't set it absurdly high.
+var uploadTimeout = 8 * time.Minute
+
+// uploadMu serializes R2 uploads across the per-camera runReplay goroutines
+// (see runReplay) so they don't split the venue's uplink and time out together.
+var uploadMu sync.Mutex
 
 // runReplay generates a clip for triggerTime, optionally uploads it to R2,
 // and saves it to the pending queue for Telegram delivery.
@@ -335,6 +451,7 @@ func runReplay(
 	eng *video.Engine,
 	cameraID string,
 	uploader *upload.Client,
+	outputDir string,
 	logger *slog.Logger,
 	triggerTime time.Time,
 ) {
@@ -347,9 +464,13 @@ func runReplay(
 			return
 		}
 		log.Error("replay: generation failed", slog.Any("error", err))
+		obs.Event(obs.Critical, "clip.failed", cameraID, "falha ao gerar o clipe",
+			slog.Time("trigger", triggerTime), slog.Any("error", err))
 		return
 	}
 	log.Info("replay: clip saved to queue", slog.String("path", replayPath))
+	obs.Event(obs.Info, "clip.ready", cameraID, "clipe gerado e na fila de entrega",
+		slog.Time("trigger", triggerTime), slog.String("path", filepath.Base(replayPath)))
 
 	// Keep the queue worker from moving this file out of pending/ while it's
 	// still being read here (R2 upload, preview generation).
@@ -357,62 +478,105 @@ func runReplay(
 	defer unlock()
 
 	if uploader != nil {
-		videoID := upload.NewID()
-		previewPath := replayPath + ".preview.gif"
-		// GeneratePreview may or may not have written the file depending on
-		// uploadErr/previewErr below; always try to clean it up so a failed
-		// R2 upload doesn't leave the gif orphaned in pending/ forever (only
-		// .mp4 files are swept out of pending/ by the delivery queue).
-		defer func() { _ = os.Remove(previewPath) }()
+		uploadClip(ctx, eng, cameraID, uploader, outputDir, replayPath, logger, triggerTime)
+	}
+}
 
-		// GIF generation only reads the local file — it doesn't depend on the
-		// upload result — so run it concurrently with the (network-bound) R2
-		// upload instead of waiting for the upload to finish first.
-		var r2Key string
-		var uploadErr, previewErr error
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			r2Key, uploadErr = uploader.Upload(ctx, replayPath, videoID)
-		}()
-		go func() {
-			defer wg.Done()
-			previewErr = eng.GeneratePreview(ctx, replayPath, previewPath)
-		}()
-		wg.Wait()
+// uploadClip pushes a freshly generated clip to R2 + the backend. Anything that
+// doesn't land is handed to the persistent retry queue (upload.RunRetryQueue),
+// which finishes it whenever the venue's uplink recovers — even after a
+// restart.
+func uploadClip(ctx context.Context, eng *video.Engine, cameraID string, uploader *upload.Client, outputDir, replayPath string, logger *slog.Logger, triggerTime time.Time) {
+	log := logger.With(slog.Time("trigger", triggerTime), slog.String("camera", cameraID))
 
-		if uploadErr != nil {
-			log.Error("replay: r2 upload failed", slog.Any("error", uploadErr))
+	videoID := upload.NewID()
+	previewPath := replayPath + ".preview.gif"
+
+	// Upload/preview/notify only read the already-completed local file, so they
+	// run on their own bounded context — a shutdown shouldn't cancel them
+	// mid-transfer (the retry queue would pick it up, but finishing now is
+	// better).
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancelUpload()
+
+	var r2Key string
+	var uploadErr, previewErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		// Serialize the actual R2 upload across cameras: two clips racing on the
+		// venue's thin uplink each get half the bandwidth and both tend to blow
+		// uploadTimeout. One at a time, each gets the full pipe.
+		uploadMu.Lock()
+		r2Key, uploadErr = uploader.Upload(uploadCtx, replayPath, videoID)
+		uploadMu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		previewErr = eng.GeneratePreview(uploadCtx, replayPath, previewPath)
+	}()
+	wg.Wait()
+
+	meta := upload.VideoMeta{
+		ID:          videoID,
+		CameraID:    cameraID,
+		R2Key:       r2Key,
+		DurationS:   int(eng.ClipDuration().Seconds()),
+		SizeBytes:   fileSize(replayPath),
+		TriggeredAt: triggerTime,
+	}
+
+	var thumbKey string
+	if uploadErr == nil && previewErr == nil {
+		if k, err := uploader.UploadPreview(uploadCtx, previewPath, videoID); err != nil {
+			log.Warn("replay: preview upload failed", slog.Any("error", err))
 		} else {
-			log.Info("replay: uploaded to r2", slog.String("key", r2Key))
+			thumbKey = k
+			meta.ThumbnailKey = k
+		}
+	} else if previewErr != nil {
+		log.Warn("replay: preview generation failed", slog.Any("error", previewErr))
+	}
 
-			var thumbnailKey string
-			if previewErr != nil {
-				log.Warn("replay: preview generation failed", slog.Any("error", previewErr))
-			} else {
-				if key, err := uploader.UploadPreview(ctx, previewPath, videoID); err != nil {
-					log.Warn("replay: preview upload failed", slog.Any("error", err))
-				} else {
-					thumbnailKey = key
-					log.Info("replay: preview uploaded", slog.String("key", key))
-				}
-			}
-
-			meta := upload.VideoMeta{
-				ID:           videoID,
-				CameraID:     cameraID,
-				R2Key:        r2Key,
-				ThumbnailKey: thumbnailKey,
-				DurationS:    int(eng.ClipDuration().Seconds()),
-				SizeBytes:    fileSize(replayPath),
-				TriggeredAt:  triggerTime,
-			}
-			if err := uploader.Notify(ctx, meta); err != nil {
-				log.Warn("replay: backend notify failed", slog.Any("error", err))
-			}
+	var notifyErr error
+	if uploadErr == nil {
+		if notifyErr = uploader.Notify(uploadCtx, meta); notifyErr != nil {
+			log.Warn("replay: backend notify failed", slog.Any("error", notifyErr))
 		}
 	}
+
+	if uploadErr == nil && notifyErr == nil {
+		_ = os.Remove(previewPath)
+		log.Info("replay: uploaded to r2", slog.String("key", r2Key))
+		obs.Event(obs.Info, "upload.ok", cameraID, "clipe no R2 + backend notificado",
+			slog.String("key", r2Key))
+		return
+	}
+
+	// Didn't fully land — persist a resumable job. Enqueue moves the .mp4 and
+	// .gif into the queue dir so the delivery sweeper / TTL don't touch them.
+	job := upload.Job{
+		VideoID:         videoID,
+		Meta:            meta,
+		ClipUploaded:    uploadErr == nil,
+		PreviewUploaded: thumbKey != "",
+		Notified:        uploadErr == nil && notifyErr == nil,
+	}
+	if err := upload.Enqueue(upload.QueueDir(outputDir), replayPath, previewPath, job); err != nil {
+		log.Error("replay: could not enqueue clip for retry — clip may be lost",
+			slog.Any("enqueue_error", err), slog.Any("upload_error", uploadErr))
+		obs.Event(obs.Critical, "upload.failed", cameraID, "upload falhou E não foi pra fila de retry — clipe em risco",
+			slog.Any("error", err))
+		return
+	}
+	cause := uploadErr
+	if cause == nil {
+		cause = notifyErr
+	}
+	log.Warn("replay: upload incomplete, queued for retry", slog.Any("error", cause))
+	obs.Event(obs.Warn, "upload.failed", cameraID, "upload/notify falhou — clipe na fila de retry",
+		slog.String("video_id", videoID), slog.Any("error", cause))
 }
 
 func fileSize(path string) int64 {
@@ -472,6 +636,8 @@ func runJoystickListener(
 			if !warned {
 				logger.Warn("joystick not found, will keep retrying",
 					slog.Int("joystick_id", joystickID), slog.Any("error", err))
+				obs.Event(obs.Critical, "button.usb_disconnected", "", "joystick/botão não encontrado — presses não funcionam",
+					slog.Int("joystick_id", joystickID), slog.Any("error", err))
 				warned = true
 			}
 			select {
@@ -483,6 +649,8 @@ func runJoystickListener(
 		}
 		if warned {
 			logger.Info("joystick connected", slog.Int("joystick_id", joystickID))
+			obs.Event(obs.Info, "button.usb_connected", "", "joystick/botão conectado",
+				slog.Int("joystick_id", joystickID))
 			warned = false
 		}
 
@@ -492,6 +660,9 @@ func runJoystickListener(
 			return nil // ctx cancelled
 		}
 		logger.Warn("joystick disconnected, will retry", slog.Any("error", err))
+		obs.Event(obs.Critical, "button.usb_disconnected", "", "joystick/botão desconectou — presses não funcionam até reconectar",
+			slog.Any("error", err))
+		warned = true
 	}
 }
 
@@ -499,6 +670,7 @@ func runJoystickListener(
 // or the device errors out, e.g. unplugged (non-nil).
 func pollJoystick(ctx context.Context, js *joystick.Joystick, db *debouncer, onPress func(time.Time)) error {
 	var prevButtons uint32
+	var lastDebouncedEvent time.Time // throttles button.debounced against contact bounce
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -522,6 +694,9 @@ func pollJoystick(ctx context.Context, js *joystick.Joystick, db *debouncer, onP
 
 			if now, ok := db.Allow(); ok {
 				onPress(now)
+			} else if time.Since(lastDebouncedEvent) > 2*time.Second {
+				lastDebouncedEvent = time.Now()
+				obs.Event(obs.Info, "button.debounced", "", "press ignorado por debounce")
 			}
 		}
 	}
@@ -552,6 +727,7 @@ func runStdinListener(ctx context.Context, d time.Duration, onPress func(time.Ti
 		if now, ok := db.Allow(); ok {
 			onPress(now)
 		} else {
+			obs.Event(obs.Info, "button.debounced", "", "press ignorado por debounce")
 			fmt.Printf("[ simulate ] debounce — ignoring (wait %v)\n", d-time.Since(db.last))
 		}
 	}
@@ -600,7 +776,6 @@ func ffmpegWorks(path string) bool {
 	cmd := exec.Command(path, "-v", "quiet", "-i", tmp.Name(), "-f", "null", "-")
 	return cmd.Run() == nil
 }
-
 
 // ─── Env helpers ──────────────────────────────────────────────────────────────
 

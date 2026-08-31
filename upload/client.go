@@ -82,8 +82,12 @@ func New(cfg Config, logger *slog.Logger) (*Client, error) {
 		bucket:  cfg.Bucket,
 		backend: strings.TrimRight(cfg.BackendURL, "/"),
 		apiKey:  cfg.APIKey,
-		http:    &http.Client{Timeout: 2 * time.Minute},
-		logger:  logger,
+		// No client-level timeout: every call path passes a context with its
+		// own deadline (uploadCtx in runReplay). A fixed http timeout here just
+		// double-bounds it and used to kill legitimately-progressing large
+		// uploads on the venue's slow uplink.
+		http:   &http.Client{},
+		logger: logger,
 	}, nil
 }
 
@@ -114,8 +118,64 @@ func (c *Client) UploadPreview(ctx context.Context, gifPath, videoID string) (st
 	return key, nil
 }
 
-// putFile opens filePath and streams it to R2 under the given key and contentType.
+// Retry tuning for putFile, mirrored from the ingestion FFmpeg reconnect
+// backoff (video/engine.go) — the venue's internet has real packet loss, so a
+// single attempt routinely loses an already-generated clip to a transient
+// network blip.
+const (
+	uploadRetryBaseDelay = 2 * time.Second
+	uploadRetryMaxDelay  = 30 * time.Second
+	uploadMaxAttempts    = 4 // ponytail: fixed cap, revisit if 4 tries still isn't enough in the field
+)
+
+// putFile opens filePath and streams it to R2 under the given key and
+// contentType, retrying with exponential backoff on failure — bounded by
+// both uploadMaxAttempts and ctx's deadline, whichever comes first.
 func (c *Client) putFile(ctx context.Context, filePath, key, contentType string) error {
+	return retryWithBackoff(ctx, uploadMaxAttempts, uploadRetryBaseDelay, uploadRetryMaxDelay,
+		func() error { return c.putFileOnce(ctx, filePath, key, contentType) },
+		func(attempt int, err error) {
+			c.logger.Warn("upload: retrying after failure",
+				slog.String("key", key),
+				slog.Int("attempt", attempt),
+				slog.Any("error", err),
+			)
+		},
+	)
+}
+
+// retryWithBackoff calls fn up to maxAttempts times, sleeping with
+// exponential backoff (capped at maxDelay) between attempts. It returns nil
+// on the first success, or fn's last error once attempts are exhausted or
+// ctx is done. onRetry, if non-nil, is called before each backoff sleep.
+func retryWithBackoff(ctx context.Context, maxAttempts int, baseDelay, maxDelay time.Duration, fn func() error, onRetry func(attempt int, err error)) error {
+	backoff := baseDelay
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		if onRetry != nil {
+			onRetry(attempt, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, maxDelay)
+	}
+	return lastErr
+}
+
+func (c *Client) putFileOnce(ctx context.Context, filePath, key, contentType string) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open %q: %w", filePath, err)
@@ -140,9 +200,25 @@ func (c *Client) putFile(ctx context.Context, filePath, key, contentType string)
 	return nil
 }
 
-// Notify sends video metadata to POST /api/videos on the PHP backend.
-// A non-2xx response is treated as an error; the caller should log and continue.
+// Notify sends video metadata to POST /api/videos on the PHP backend,
+// retrying with the same backoff as putFile — a clip that survived the R2
+// upload shouldn't be lost to the same network blips on this much smaller
+// request. A non-2xx response after all attempts is returned to the caller
+// to log and continue.
 func (c *Client) Notify(ctx context.Context, meta VideoMeta) error {
+	return retryWithBackoff(ctx, uploadMaxAttempts, uploadRetryBaseDelay, uploadRetryMaxDelay,
+		func() error { return c.notifyOnce(ctx, meta) },
+		func(attempt int, err error) {
+			c.logger.Warn("upload: retrying notify after failure",
+				slog.String("video_id", meta.ID),
+				slog.Int("attempt", attempt),
+				slog.Any("error", err),
+			)
+		},
+	)
+}
+
+func (c *Client) notifyOnce(ctx context.Context, meta VideoMeta) error {
 	body, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/edipo/replay-saas/internal/obs"
 )
 
 // ─── Ingestion Engine ─────────────────────────────────────────────────────────
@@ -32,6 +34,8 @@ func (e *Engine) runIngestion(ctx context.Context) {
 
 		attempt++
 		log.Info("starting FFmpeg", slog.Int("attempt", attempt))
+		obs.Event(obs.Info, "ingest.started", e.cfg.CameraID, "iniciando FFmpeg de ingestão",
+			slog.Int("attempt", attempt))
 
 		err := e.runFFmpegIngestion(ctx)
 
@@ -46,11 +50,15 @@ func (e *Engine) runIngestion(ctx context.Context) {
 				slog.Any("error", err),
 				slog.Duration("backoff", backoff),
 			)
+			obs.Event(obs.Warn, "ingest.exited", e.cfg.CameraID, "FFmpeg de ingestão caiu — vai reconectar",
+				slog.Any("error", err), slog.Duration("backoff", backoff))
 		} else {
 			// Unexpected clean exit (should not normally happen for a live stream).
 			log.Warn("FFmpeg exited cleanly – will reconnect",
 				slog.Duration("backoff", backoff),
 			)
+			obs.Event(obs.Warn, "ingest.exited", e.cfg.CameraID, "FFmpeg de ingestão saiu limpo (inesperado) — vai reconectar",
+				slog.Duration("backoff", backoff))
 		}
 
 		select {
@@ -174,6 +182,9 @@ func (e *Engine) watchForStallEvery(ctx context.Context, kill context.CancelFunc
 					slog.Bool("ever_produced_segment", ok),
 					slog.Duration("threshold", threshold),
 				)
+				obs.Event(obs.Critical, "ingest.stalled", e.cfg.CameraID,
+					"ingestão travada (FFmpeg parou de rotacionar segmentos) — matando pra reconectar",
+					slog.Bool("ever_produced_segment", ok), slog.Duration("threshold", threshold))
 				kill()
 				return
 			}
@@ -194,7 +205,14 @@ func isStalled(now, start, newest time.Time, hasSegments bool, threshold time.Du
 // newestSegmentTime returns the most recent segment start time found in
 // BufferDir, or ok=false if the directory has no valid segment files yet.
 func (e *Engine) newestSegmentTime() (newest time.Time, ok bool) {
-	entries, err := os.ReadDir(e.cfg.BufferDir)
+	return NewestSegmentTime(e.cfg.BufferDir)
+}
+
+// NewestSegmentTime returns the most recent segment start time (parsed from the
+// filename) found in dir, or ok=false when dir has no valid segment files yet.
+// Exported so the observability layer can gauge per-camera buffer freshness.
+func NewestSegmentTime(dir string) (newest time.Time, ok bool) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -294,8 +312,8 @@ func (e *Engine) cleanOldSegments() {
 // Expected format: seg_YYYYMMDD_HHMMSS.ts   (matches segmentFilePattern)
 // Example:         seg_20240315_143022.ts   → 2024-03-15 14:30:22 local time
 func parseSegmentTime(name string) (time.Time, error) {
-	base := strings.TrimSuffix(name, ".ts")        // seg_20240315_143022
-	ts := strings.TrimPrefix(base, "seg_")          // 20240315_143022
+	base := strings.TrimSuffix(name, ".ts") // seg_20240315_143022
+	ts := strings.TrimPrefix(base, "seg_")  // 20240315_143022
 
 	if len(ts) != len("20060102_150405") {
 		return time.Time{}, fmt.Errorf("unexpected segment filename: %q", name)
