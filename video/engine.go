@@ -90,6 +90,17 @@ type Config struct {
 	// scales to keep aspect. Lower it on thin-uplink venues to shrink the file.
 	// Default: 1280 (720p)
 	ClipWidth int
+
+	// LiveDir is the parent directory for the near-live HLS stream. When set
+	// (together with LiveRTSPUrl), Start runs a separate copy-only FFmpeg that
+	// writes a rolling HLS window to <LiveDir>/<CameraID>/. Meant to be a small
+	// tmpfs mount. Empty disables the live stream.
+	LiveDir string
+
+	// LiveRTSPUrl is the source for the live stream — normally the camera's
+	// low-bitrate substream, so it fits a thin uplink without touching the
+	// full-quality clip pipeline. Empty disables the live stream.
+	LiveRTSPUrl string
 }
 
 func (c *Config) applyDefaults() {
@@ -103,7 +114,14 @@ func (c *Config) applyDefaults() {
 		c.SegmentTime = 2
 	}
 	if c.BufferDur == 0 {
-		c.BufferDur = 60 * time.Second
+		// ponytail: 5min, not the clip's 25s window — on the weak field
+		// hardware a single generation pass (concat+encode+music) has taken
+		// 3-4min under load, and the press queue (cap 1) blocks a queued
+		// trigger's own GenerateReplay until the current one finishes. The
+		// buffer has to outlive that wait or the queued clip's segments are
+		// already pruned by the time it starts. Bump via REPLAY_BUFFER_DUR_S
+		// if this machine gets slower still.
+		c.BufferDur = 300 * time.Second
 	}
 	if c.PreCapture == 0 {
 		c.PreCapture = 15 * time.Second
@@ -178,6 +196,22 @@ func (e *Engine) Start(ctx context.Context) {
 	e.wg.Add(2)
 	go func() { defer e.wg.Done(); e.runIngestion(ctx) }()
 	go func() { defer e.wg.Done(); e.runCleanup(ctx) }()
+
+	switch {
+	case e.cfg.LiveDir == "":
+		// live disabled globally – nothing to log per camera
+	case e.cfg.LiveRTSPUrl == "":
+		e.logger.Warn("live stream skipped: no substream URL for this camera "+
+			"(set REPLAY_CAM_<n>_LIVE_RTSP_URL, or make the RTSP URL contain subtype=0)",
+			"camera", e.cfg.CameraID)
+	default:
+		e.logger.Info("live stream enabled",
+			"live_dir", filepath.Join(e.cfg.LiveDir, e.cfg.CameraID),
+			"live_rtsp_url", e.cfg.LiveRTSPUrl,
+		)
+		e.wg.Add(1)
+		go func() { defer e.wg.Done(); e.runLiveHLS(ctx) }()
+	}
 }
 
 // Wait blocks until all background goroutines started by Start have returned.

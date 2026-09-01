@@ -24,6 +24,9 @@ func (r *Recorder) ServeHTTP(ctx context.Context) {
 	mux.HandleFunc("/trigger", r.handleTrigger)
 	mux.HandleFunc("/botao", r.handleBotao)
 	mux.HandleFunc("/test-alert", r.handleTestAlert)
+	if r.cfg.LiveDir != "" {
+		mux.Handle("/live/", r.liveHandler())
+	}
 	mux.HandleFunc("/", r.handleIndex)
 
 	srv := &http.Server{Addr: r.cfg.HTTPAddr, Handler: mux}
@@ -236,6 +239,10 @@ func (r *Recorder) handleIndex(w http.ResponseWriter, req *http.Request) {
 	if strings.HasPrefix(req.Host, "botao.") {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(botaoHTML))
+		return
+	}
+	if r.cfg.LiveDir != "" && strings.HasPrefix(req.Host, "aovivo.") {
+		r.handleLivePage(w, req)
 		return
 	}
 	s := r.snapshot()

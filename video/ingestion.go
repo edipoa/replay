@@ -145,7 +145,7 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 		}
 	}()
 
-	go e.watchForStall(procCtx, killFFmpeg)
+	go e.watchForStall(procCtx, killFFmpeg, e.cfg.BufferDir, "ingestion")
 
 	return cmd.Wait()
 }
@@ -156,16 +156,25 @@ func (e *Engine) runFFmpegIngestion(ctx context.Context) error {
 // logging an error — invisible to the normal exit-based reconnect logic,
 // while the cleanup ticker keeps deleting the aging segment until the buffer
 // dir is permanently empty.
-func (e *Engine) watchForStall(ctx context.Context, kill context.CancelFunc) {
+// component is "ingestion" or "live" — a stalled ingestion is Critical (no
+// clips), a stalled live stream is only Warn (the monitoring page is degraded).
+func (e *Engine) watchForStall(ctx context.Context, kill context.CancelFunc, dir, component string) {
 	threshold := max(3*time.Duration(e.cfg.SegmentTime)*time.Second, 10*time.Second)
-	e.watchForStallEvery(ctx, kill, threshold, cleanupInterval)
+	e.watchForStallEvery(ctx, kill, dir, component, threshold, cleanupInterval)
 }
 
-// watchForStallEvery is watchForStall with threshold/checkInterval as
+// watchForStallEvery is watchForStall with dir/threshold/checkInterval as
 // parameters so the decision logic can be exercised in tests without
 // waiting on real timers.
-func (e *Engine) watchForStallEvery(ctx context.Context, kill context.CancelFunc, threshold, checkInterval time.Duration) {
-	log := e.logger.With(slog.String("component", "ingestion"))
+func (e *Engine) watchForStallEvery(ctx context.Context, kill context.CancelFunc, dir, component string, threshold, checkInterval time.Duration) {
+	log := e.logger.With(slog.String("component", component))
+
+	stallLevel, stallKind, stallMsg := obs.Critical, "ingest.stalled",
+		"ingestão travada (FFmpeg parou de rotacionar segmentos) — matando pra reconectar"
+	if component == "live" {
+		stallLevel, stallKind, stallMsg = obs.Warn, "live.stalled",
+			"transmissão ao vivo travada (FFmpeg parou de rotacionar segmentos) — matando pra reconectar"
+	}
 
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
@@ -176,14 +185,13 @@ func (e *Engine) watchForStallEvery(ctx context.Context, kill context.CancelFunc
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			newest, ok := e.newestSegmentTime()
+			newest, ok := NewestSegmentTime(dir)
 			if isStalled(time.Now(), start, newest, ok, threshold) {
 				log.Error("segment output stalled – killing FFmpeg",
 					slog.Bool("ever_produced_segment", ok),
 					slog.Duration("threshold", threshold),
 				)
-				obs.Event(obs.Critical, "ingest.stalled", e.cfg.CameraID,
-					"ingestão travada (FFmpeg parou de rotacionar segmentos) — matando pra reconectar",
+				obs.Event(stallLevel, stallKind, e.cfg.CameraID, stallMsg,
 					slog.Bool("ever_produced_segment", ok), slog.Duration("threshold", threshold))
 				kill()
 				return

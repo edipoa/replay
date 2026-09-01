@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -28,9 +29,10 @@ import (
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 type cameraConfig struct {
-	ID        string // "cam1", "cam2", …
-	RTSPUrl   string
-	BufferDir string
+	ID          string // "cam1", "cam2", …
+	RTSPUrl     string
+	BufferDir   string
+	LiveRTSPUrl string // substream for the near-live view; "" disables live for this camera
 }
 
 type appConfig struct {
@@ -38,6 +40,7 @@ type appConfig struct {
 	Cameras     []cameraConfig
 	OutputDir   string
 	SegmentTime int
+	BufferDurS  int // seconds of segment buffer retained on disk
 	ClipWidth   int
 
 	// Delivery
@@ -57,6 +60,10 @@ type appConfig struct {
 	HTTPAddr      string // status server listen addr (":8088")
 	AlertThreadID int    // Telegram message_thread_id for critical alerts (0 = main feed)
 
+	// Live view (near-live HLS on the aovivo.* host)
+	LiveEnabled bool
+	LiveDir     string // parent dir for per-camera HLS (should be a small tmpfs)
+
 	// Dev/test
 	Simulate bool
 }
@@ -67,6 +74,7 @@ func loadConfig() (appConfig, error) {
 	cfg := appConfig{
 		OutputDir:           envutil.Or("REPLAY_OUTPUT_DIR", "/tmp/replays"),
 		SegmentTime:         envutil.IntOr("REPLAY_SEGMENT_TIME_S", 2),
+		BufferDurS:          envutil.IntOr("REPLAY_BUFFER_DUR_S", 300),
 		ClipWidth:           envutil.IntOr("REPLAY_CLIP_WIDTH", 1280),
 		AgendaPath:          envutil.Or("REPLAY_AGENDA_PATH", agendaDefault(simulate)),
 		TelegramLogPath:     envutil.Or("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
@@ -77,6 +85,8 @@ func loadConfig() (appConfig, error) {
 		DebounceMs:          envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
 		HTTPAddr:            envutil.Or("REPLAY_HTTP_ADDR", ":8088"),
 		AlertThreadID:       envutil.IntOr("REPLAY_ALERT_THREAD_ID", 0),
+		LiveEnabled:         os.Getenv("REPLAY_LIVE_ENABLED") == "true",
+		LiveDir:             envutil.Or("REPLAY_LIVE_DIR", "/tmp/replay_live"),
 		Simulate:            simulate,
 	}
 
@@ -106,7 +116,18 @@ func loadConfig() (appConfig, error) {
 			bufDir = fmt.Sprintf("/tmp/replay_buffer_%d", i)
 		}
 
-		cfg.Cameras = append(cfg.Cameras, cameraConfig{ID: id, RTSPUrl: url, BufferDir: bufDir})
+		var liveURL string
+		if cfg.LiveEnabled {
+			liveURL = os.Getenv(fmt.Sprintf("REPLAY_CAM_%d_LIVE_RTSP_URL", i))
+			if liveURL == "" {
+				// Default: the camera substream — same URL with subtype=1.
+				if sub := strings.Replace(url, "subtype=0", "subtype=1", 1); sub != url {
+					liveURL = sub
+				}
+			}
+		}
+
+		cfg.Cameras = append(cfg.Cameras, cameraConfig{ID: id, RTSPUrl: url, BufferDir: bufDir, LiveRTSPUrl: liveURL})
 	}
 
 	if len(cfg.Cameras) == 0 {
@@ -163,12 +184,15 @@ func run(logger *slog.Logger) error {
 			BufferDir:           cam.BufferDir,
 			OutputDir:           cfg.OutputDir,
 			SegmentTime:         cfg.SegmentTime,
+			BufferDur:           time.Duration(cfg.BufferDurS) * time.Second,
 			ClipWidth:           cfg.ClipWidth,
 			FFmpegBin:           ffmpegBin,
 			WatermarkPath:       cfg.WatermarkPath,
 			LogoPath:            cfg.LogoPath,
 			BackgroundMusicPath: cfg.BackgroundMusicPath,
 			CameraID:            cam.ID,
+			LiveDir:             cfg.LiveDir,
+			LiveRTSPUrl:         cam.LiveRTSPUrl,
 		}, logger.With(slog.String("camera", cam.ID)))
 		if err != nil {
 			return fmt.Errorf("video engine %s: %w", cam.ID, err)
@@ -242,6 +266,9 @@ func run(logger *slog.Logger) error {
 		BufferDirs:    bufferDirs,
 		NewestSegment: video.NewestSegmentTime,
 		TriggerToken:  os.Getenv("REPLAY_TRIGGER_TOKEN"),
+	}
+	if cfg.LiveEnabled {
+		obsCfg.LiveDir = cfg.LiveDir
 	}
 	if bot != nil {
 		obsCfg.Bot = bot // only assign non-nil — a typed nil in the interface would panic on send

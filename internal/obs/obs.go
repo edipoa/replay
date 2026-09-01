@@ -13,6 +13,7 @@
 //	button.usb_connected   button.usb_disconnected
 //	ingest.started         ingest.exited         ingest.stalled
 //	ingest.behind          camera.down           camera.up
+//	live.started           live.exited           live.stalled
 //	clip.ready             clip.failed           clip.stale
 //	deliver.ok             deliver.failed        deliver.orphaned
 //	upload.ok              upload.failed         notify.failed
@@ -56,6 +57,12 @@ type Config struct {
 	Bot         TelegramSender    // nil disables alerting (events still recorded)
 	AlertThread int64             // Telegram message_thread_id for alerts (0 = main feed)
 	BufferDirs  map[string]string // cameraID -> buffer dir, for the health snapshot
+
+	// LiveDir is the parent dir of the near-live HLS streams (<LiveDir>/<cam>/
+	// index.m3u8 + seg_*.ts). When set, the status server serves those files at
+	// /live/<cam>/... and the aovivo.* host gets the multi-camera player page.
+	// Empty disables both.
+	LiveDir string
 
 	// TriggerToken, when non-empty, is the shared PIN required to fire a replay
 	// via POST /trigger (and the /botao phone page). Blank = no auth, fine on a

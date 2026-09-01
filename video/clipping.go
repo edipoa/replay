@@ -362,6 +362,18 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 			e.logger.Warn("clip has no audio track, using music as sole audio", slog.String("camera", e.cfg.CameraID))
 			filterComplex = "[1:a]volume=1.0[aout]"
 		}
+
+		// Write to a temp path outside pending/, same reason as tempVideoPath
+		// above: -movflags +faststart makes ffmpeg reopen its own output file
+		// at the end to shift the moov atom to the front, and the delivery
+		// queue sweeps pending/ every 30s for any *.mp4 it finds. Writing
+		// straight to outputPath let that sweep grab and move the file out
+		// from under ffmpeg mid-write, which failed the whole clip with
+		// "unable to re-open output file for shifting data". Rename into
+		// pending/ only once ffmpeg is done — an atomic op on the same fs.
+		tempFinalPath := filepath.Join(e.cfg.OutputDir, filepath.Base(outputPath)+".final.tmp.mp4")
+		defer os.Remove(tempFinalPath)
+
 		pass3 := []string{
 			"-loglevel", "warning",
 			"-i", tempVideoPath,
@@ -375,10 +387,13 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 			"-shortest",
 			"-movflags", "+faststart",
 			"-y",
-			outputPath,
+			tempFinalPath,
 		}
 		if err := e.runFFmpegPass(ctx, "music pass", pass3); err != nil {
 			return err
+		}
+		if err := os.Rename(tempFinalPath, outputPath); err != nil {
+			return fmt.Errorf("move final clip into pending: %w", err)
 		}
 	}
 

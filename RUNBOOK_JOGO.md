@@ -27,6 +27,14 @@ cd /home/replay/replay-agent
 Preenche RTSP das câmeras, R2/backend (se usados) e já testa a conexão com
 cada câmera.
 
+**Atenção ao `REPLAY_OUTPUT_DIR`:** não pode ser um path em tmpfs (`/tmp` é
+tmpfs por padrão em boa parte das distros Ubuntu). Nessa máquina fraca de 4GB
+de RAM, o buffer de vídeo + `replay.db` + clipes pendentes competindo por
+memória com o resto do processo já causou trava de ingestão em produção.
+Use um path em disco persistente dentro do `$HOME` do usuário real que roda
+o serviço — confira com `echo $HOME` no notebook, não assuma qual é (o user
+já variou entre deploys: `replay`, `edipo`, `campo`).
+
 ---
 
 ### 3. Impedir suspensão (equivalente ao antigo `gsettings`, mas sem GNOME)
@@ -250,6 +258,33 @@ Access — o pessoal no local precisa abrir direto no celular. O painel `/` e
 `/events` também respondem nesse hostname; se algum dia quiser fechar o botão,
 é o `REPLAY_TRIGGER_TOKEN` que faz isso (só o `POST /trigger` valida o PIN; a
 página `/botao` só pede e repassa).
+
+**Transmissão ao vivo** (`aovivo.vianasociety.com.br`): mostra as câmeras ao
+vivo no navegador (HLS, ~5-20s de atraso). Design completo em
+`docs/design-live-stream.md`. Passos pra ligar:
+
+```bash
+# 1. tmpfs pros segmentos da live (o HD não aguenta a rotação)
+echo 'tmpfs /tmp/replay_live tmpfs noatime,size=128M,mode=1777 0 0' | sudo tee -a /etc/fstab
+sudo mkdir -p /tmp/replay_live && sudo mount -a
+
+# 2. .env
+REPLAY_LIVE_ENABLED=true
+
+# 3. rota + ingress no cloudflared (igual ao botao), ANTES do catch-all:
+cloudflared tunnel route dns <nome-ou-id-do-tunnel> aovivo.vianasociety.com.br
+#     - hostname: aovivo.vianasociety.com.br
+#       service: http://localhost:8088
+sudo systemctl restart cloudflared
+
+# 4. reiniciar o agente
+sudo systemctl restart replay-agent
+```
+
+A live usa o **substream** da câmera (`subtype=1`) pra caber no uplink — a
+qualidade cheia (`subtype=0`) segue só nos clipes. Limite atual: ~1 espectador
+simultâneo direto do notebook; pra vários usuários é preciso a Fase 2 (sync do
+diretório da live pro R2), descrita no doc de design.
 
 ---
 

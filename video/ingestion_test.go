@@ -72,7 +72,7 @@ func TestWatchForStallKillsWhenNothingAppears(t *testing.T) {
 	killed := make(chan struct{})
 	kill := func() { close(killed) }
 
-	go e.watchForStallEvery(ctx, kill, 30*time.Millisecond, 10*time.Millisecond)
+	go e.watchForStallEvery(ctx, kill, e.cfg.BufferDir, "ingestion", 30*time.Millisecond, 10*time.Millisecond)
 
 	select {
 	case <-killed:
