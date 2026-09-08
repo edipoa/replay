@@ -25,6 +25,9 @@ func (r *Recorder) ServeHTTP(ctx context.Context) {
 	mux.HandleFunc("/botao", r.handleBotao)
 	mux.HandleFunc("/test-alert", r.handleTestAlert)
 	if r.cfg.LiveDir != "" {
+		if r.cfg.LiveGate != nil {
+			mux.HandleFunc("/live/state.json", r.handleLiveState)
+		}
 		mux.Handle("/live/", r.liveHandler())
 		mux.Handle("/sponsors/", r.sponsorsHandler())
 	}

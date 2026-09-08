@@ -20,6 +20,7 @@ import (
 	"github.com/edipo/replay-saas/delivery"
 	"github.com/edipo/replay-saas/internal/envutil"
 	"github.com/edipo/replay-saas/internal/joystick"
+	"github.com/edipo/replay-saas/internal/live"
 	"github.com/edipo/replay-saas/internal/obs"
 	"github.com/edipo/replay-saas/internal/selftest"
 	"github.com/edipo/replay-saas/upload"
@@ -60,9 +61,11 @@ type appConfig struct {
 	HTTPAddr      string // status server listen addr (":8088")
 	AlertThreadID int    // Telegram message_thread_id for critical alerts (0 = main feed)
 
-	// Live view (near-live HLS on the aovivo.* host)
-	LiveEnabled bool
-	LiveDir     string // parent dir for per-camera HLS (should be a small tmpfs)
+	// Live view (near-live HLS on the aovivo.* host). On/off is driven by the
+	// replay-site schedule (live_control table + slots + games), polled by the
+	// agent — there is no local enable flag.
+	LiveDir          string // parent dir for per-camera HLS (should be a small tmpfs)
+	LivePollInterval time.Duration
 
 	// Dev/test
 	Simulate bool
@@ -85,8 +88,8 @@ func loadConfig() (appConfig, error) {
 		DebounceMs:          envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
 		HTTPAddr:            envutil.Or("REPLAY_HTTP_ADDR", ":8088"),
 		AlertThreadID:       envutil.IntOr("REPLAY_ALERT_THREAD_ID", 0),
-		LiveEnabled:         os.Getenv("REPLAY_LIVE_ENABLED") == "true",
 		LiveDir:             envutil.Or("REPLAY_LIVE_DIR", "/tmp/replay_live"),
+		LivePollInterval:    time.Duration(envutil.IntOr("REPLAY_LIVE_POLL_INTERVAL_S", 30)) * time.Second,
 		Simulate:            simulate,
 	}
 
@@ -116,14 +119,12 @@ func loadConfig() (appConfig, error) {
 			bufDir = fmt.Sprintf("/tmp/replay_buffer_%d", i)
 		}
 
-		var liveURL string
-		if cfg.LiveEnabled {
-			liveURL = os.Getenv(fmt.Sprintf("REPLAY_CAM_%d_LIVE_RTSP_URL", i))
-			if liveURL == "" {
-				// Default: the camera substream — same URL with subtype=1.
-				if sub := strings.Replace(url, "subtype=0", "subtype=1", 1); sub != url {
-					liveURL = sub
-				}
+		// Live source: explicit override, else the camera substream (subtype=1).
+		// Whether it actually streams is decided later by the schedule poller.
+		liveURL := os.Getenv(fmt.Sprintf("REPLAY_CAM_%d_LIVE_RTSP_URL", i))
+		if liveURL == "" {
+			if sub := strings.Replace(url, "subtype=0", "subtype=1", 1); sub != url {
+				liveURL = sub
 			}
 		}
 
@@ -176,7 +177,33 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("ffmpeg binary", slog.String("path", ffmpegBin))
 
-	// ── 3. Video engines (one per camera) ────────────────────────────────────
+	// ── 3. Live schedule gate ────────────────────────────────────────────────
+	// The live stream is allowed on only during registered slots/games (plus a
+	// manual override), computed by the replay-site backend. The gate needs the
+	// backend: without it there is no schedule, so the live stays down.
+	backendURL := strings.TrimRight(os.Getenv("REPLAY_BACKEND_URL"), "/")
+	backendKey := os.Getenv("REPLAY_BACKEND_API_KEY")
+	var liveGate *live.Gate
+	liveWanted := false
+	for _, cam := range cfg.Cameras {
+		if cam.LiveRTSPUrl != "" {
+			liveWanted = true
+		}
+	}
+	switch {
+	case !liveWanted:
+		// no substream configured on any camera — nothing to gate
+	case backendURL == "" || backendKey == "":
+		logger.Warn("live desativada: REPLAY_BACKEND_URL/REPLAY_BACKEND_API_KEY ausentes — " +
+			"sem agenda para controlar a transmissão, ela não sobe")
+		for i := range cfg.Cameras {
+			cfg.Cameras[i].LiveRTSPUrl = ""
+		}
+	default:
+		liveGate = live.NewGate()
+	}
+
+	// ── 3b. Video engines (one per camera) ───────────────────────────────────
 	var engines []*video.Engine
 	for _, cam := range cfg.Cameras {
 		eng, err := video.New(video.Config{
@@ -193,6 +220,7 @@ func run(logger *slog.Logger) error {
 			CameraID:            cam.ID,
 			LiveDir:             cfg.LiveDir,
 			LiveRTSPUrl:         cam.LiveRTSPUrl,
+			LiveGate:            liveGate,
 		}, logger.With(slog.String("camera", cam.ID)))
 		if err != nil {
 			return fmt.Errorf("video engine %s: %w", cam.ID, err)
@@ -267,8 +295,9 @@ func run(logger *slog.Logger) error {
 		NewestSegment: video.NewestSegmentTime,
 		TriggerToken:  os.Getenv("REPLAY_TRIGGER_TOKEN"),
 	}
-	if cfg.LiveEnabled {
+	if liveGate != nil {
 		obsCfg.LiveDir = cfg.LiveDir
+		obsCfg.LiveGate = liveGate
 	}
 	if bot != nil {
 		obsCfg.Bot = bot // only assign non-nil — a typed nil in the interface would panic on send
@@ -295,6 +324,27 @@ func run(logger *slog.Logger) error {
 	go rec.RunHeartbeat(ctx)
 	obs.Event(obs.Info, "agent.started", "", "replay-agent iniciado",
 		"cameras", len(cfg.Cameras), "simulate", cfg.Simulate)
+
+	// ── 6a. Live schedule poller ─────────────────────────────────────────────
+	if liveGate != nil {
+		poller := &live.Poller{
+			URL:      backendURL + "/api/live/state",
+			APIKey:   backendKey,
+			Interval: cfg.LivePollInterval,
+			Gate:     liveGate,
+			Logger:   logger.With(slog.String("component", "live-poll")),
+			OnPollError: func(err error, streak int) {
+				if streak == 1 || streak%10 == 0 {
+					obs.Event(obs.Warn, "live.poll_failed", "",
+						"poll do estado da live falhou — mantendo último estado conhecido",
+						"streak", streak, "error", err.Error())
+				}
+			},
+		}
+		go poller.Run(ctx)
+		logger.Info("live schedule poller enabled",
+			slog.String("url", poller.URL), slog.Duration("interval", cfg.LivePollInterval))
+	}
 
 	// ── 6. Start video ingestion ──────────────────────────────────────────────
 	for i, eng := range engines {

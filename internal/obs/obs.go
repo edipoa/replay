@@ -28,6 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/edipo/replay-saas/internal/live"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -63,6 +65,10 @@ type Config struct {
 	// /live/<cam>/... and the aovivo.* host gets the multi-camera player page.
 	// Empty disables both.
 	LiveDir string
+
+	// LiveGate is the schedule on/off latch. When set, /live/state.json reports
+	// it and the aovivo page shows a "fora do ar" screen while it is off.
+	LiveGate *live.Gate
 
 	// TriggerToken, when non-empty, is the shared PIN required to fire a replay
 	// via POST /trigger (and the /botao phone page). Blank = no auth, fine on a

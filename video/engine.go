@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/edipo/replay-saas/internal/live"
 )
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -101,6 +103,11 @@ type Config struct {
 	// low-bitrate substream, so it fits a thin uplink without touching the
 	// full-quality clip pipeline. Empty disables the live stream.
 	LiveRTSPUrl string
+
+	// LiveGate is the shared on/off latch driven by the replay-site schedule
+	// poller. When nil the live FFmpeg runs unconditionally (test / no-backend);
+	// when set, runLiveHLS only runs FFmpeg while the gate is on.
+	LiveGate *live.Gate
 }
 
 func (c *Config) applyDefaults() {
