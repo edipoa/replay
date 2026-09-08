@@ -282,9 +282,26 @@ sudo systemctl restart replay-agent
 ```
 
 A live usa o **substream** da câmera (`subtype=1`) pra caber no uplink — a
-qualidade cheia (`subtype=0`) segue só nos clipes. Limite atual: ~1 espectador
-simultâneo direto do notebook; pra vários usuários é preciso a Fase 2 (sync do
-diretório da live pro R2), descrita no doc de design.
+qualidade cheia (`subtype=0`) segue só nos clipes. A página é **somente
+visualização** (o botão de gerar clipe foi removido em 2026-09-06 — não escala
+pra público amplo; o operador dispara replay pelo botão físico, joystick ou
+`/botao`).
+
+**Quantos espectadores aguenta:** direto do notebook, ~15–25 simultâneos (cada
+um ~1 Mbit/s de substream contra ~56 Mbit/s do uplink cabeado). Pra centenas,
+crie uma **Cache Rule no Cloudflare** (dashboard → Caching → Cache Rules), sem
+mudar código:
+
+- match `Hostname eq "aovivo.vianasociety.com.br" and
+  starts_with(http.request.uri.path, "/live/") and
+  ends_with(http.request.uri.path, ".ts")` → *Eligible for cache*, Edge TTL
+  **override 60s**;
+- mesma coisa pra `.m3u8` → Edge TTL **override 1s**.
+
+Isso trava a banda da origem em ~5 Mbit/s independente do nº de espectadores.
+Confirme com `curl -sI` que os `.ts`/`.m3u8` voltam `cf-cache-status: HIT` no
+2º acesso. (Se o Cloudflare reclamar do volume de vídeo — ToS 2.8 — o caminho é
+migrar pro R2, Fase 2 no doc de design.)
 
 ---
 

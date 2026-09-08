@@ -59,8 +59,16 @@ func TestLiveCamerasAndPage(t *testing.T) {
 	if b := rec.Body.String(); !strings.Contains(b, `class="strip"`) ||
 		!strings.Contains(b, `id="v-cam1"`) || !strings.Contains(b, `id="v-cam2"`) ||
 		!strings.Contains(b, `var cams = ["cam1","cam2"]`) ||
-		!strings.Contains(b, "function correction(") {
-		t.Fatalf("two-camera page missing panorama strip / sync:\n%s", b)
+		!strings.Contains(b, `class="playgate"`) ||
+		!strings.Contains(b, "function correction(") ||
+		!strings.Contains(b, `class="fs-btn"`) ||
+		!strings.Contains(b, "classList.add('immersive')") ||
+		!strings.Contains(b, "--seaml") || !strings.Contains(b, `setLen('--blend'`) ||
+		!strings.Contains(b, `setLen('--dxr'`) || !strings.Contains(b, `qp.get('cal')`) ||
+		!strings.Contains(b, `setLen('--rotr'`) || !strings.Contains(b, "shift+arrasta") ||
+		strings.Contains(b, "var(--gold) 55%") || strings.Contains(b, "--keyr") ||
+		strings.Contains(b, "conic-gradient") {
+		t.Fatalf("two-camera page missing panorama strip / gate / sync / fullscreen / seam knobs:\n%s", b)
 	}
 
 	// No cameras → the empty-state page, no <video>.

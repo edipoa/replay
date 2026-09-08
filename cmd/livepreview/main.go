@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/edipo/replay-saas/internal/obs"
 )
@@ -17,10 +18,16 @@ import (
 // plain browser sees the live page. Open http://127.0.0.1:8890/?seam=4
 func main() {
 	sp := os.Args[1]
-	r, err := obs.New(obs.Config{DBPath: sp + "/preview.db", HTTPAddr: "127.0.0.1:8899", LiveDir: sp + "/live"})
+	db := sp + "/preview.db"
+	if len(os.Args) > 2 {
+		db = os.Args[2]
+	}
+	r, err := obs.New(obs.Config{DBPath: db, HTTPAddr: "127.0.0.1:8899", LiveDir: sp + "/live"})
 	if err != nil {
 		panic(err)
 	}
+	r.SetTrigger(func(t time.Time) { log.Println("TRIGGER fired for", t.Format(time.RFC3339)) })
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go r.ServeHTTP(ctx)

@@ -1,6 +1,12 @@
 # Design — live camera view (`aovivo.vianasociety.com.br`)
 
 Status: accepted 2026-08-31. Implemented in the same change.
+Revised 2026-09-06: public clip button removed (see decision 6b); uplink
+re-measured on wired ethernet; scale path is now a Cloudflare Cache Rule, not R2
+(see decisions 7b, 8).
+Revised 2026-09-07: panorama polish (see "Two-camera panorama" below) — gold
+centre seam removed, fullscreen button added, seam alignment made tunable via
+`?`-knobs with a `?cal=1` on-page calibration panel.
 
 ## Understanding summary
 
@@ -97,6 +103,28 @@ camera subtype=1  ──▶  ffmpeg -c copy -f hls   (video/live.go, 1 goroutine
   neither yields a substream URL, live is skipped for that camera with a warn.
 - `LiveDir` is also passed into `obs.Config`.
 
+### Two-camera panorama (revised 2026-09-07)
+
+With exactly two cameras `liveHTML` renders one panoramic strip (cam left, cam
+right) instead of the grid. The two feeds butt at the centre; each keeps its
+full width, letterboxed top/bottom. A single play gate drives both; a JS loop
+keeps them on the same wall-clock instant via `EXT-X-PROGRAM-DATE-TIME`.
+
+- **No centre divider.** An earlier build drew a gold "light-leak" line down
+  the seam; removed — the brief was "make it look like one image".
+- **Fullscreen button** in the header: adds `body.immersive` (CSS overlay
+  hiding header/footer — works everywhere incl. iOS) *and* calls the
+  Fullscreen API + `screen.orientation.lock('landscape')` where supported.
+- **Seam alignment is hand-tuned, live, via `?`-knobs**, then baked into the
+  `:root` custom properties (`--seaml/--seamr` inner-edge trim %, `--dxl/--dxr`
+  `--dyl/--dyr` shift px, `--rotl/--rotr` roll deg, `--blend` cross-fade px).
+  `?cal=1` shows an on-page panel: sliders for trim/blend, drag a feed to move
+  it, shift-drag to roll it, "ver cru" to zero everything, and a live `?query`
+  readout to copy. Current bake: `--seaml:19%; --seamr:18.5%`, everything else
+  0 — a plain symmetric-ish clip read best; shift/roll/blend all landed at 0.
+  Two cameras with no overlap can't stitch perfectly for near objects; the
+  knobs get it close and `--blend` (if set) softens the rest.
+
 ### Ops (run on the deploy laptop)
 
 ```sh
@@ -130,16 +158,40 @@ sudo systemctl restart cloudflared
 | 3 | Live segments on tmpfs | on the HDD | 5400 rpm HDD can't take the rotation churn alongside ingestion + encode |
 | 4 | `seg_<strftime>.ts` segment names for live | sequential HLS names | reuses `NewestSegmentTime` + stall watchdog unchanged |
 | 5 | hls.js via jsdelivr CDN | embed in the binary | the viewer's browser fetches it, not the venue; keeps 300 KB out of the binary |
-| 6 | No auth | PIN like `/botao` | operator's call; page exposes only the substream — no clip, no trigger |
-| 7 | R2 push deferred to phase 2 | do it now | direct-from-laptop serves ~1 viewer (enough for internal monitoring); phase 2 syncs the live dir → R2 and the page points at the CDN |
+| 6 | No auth on the page | PIN like `/botao` | operator's call; page exposes only the substream |
+| 6b | ~~Public clip button (`POST /clip`)~~ **reverted 2026-09-06** — page is view-only again | keep it; just raise the cooldown; rate-limit per IP | owner's call. With the wired uplink the target is a wide public audience, and a single 60 s global cooldown can't arbitrate a clip button shared by hundreds of viewers. The operator loses nothing — physical button, joystick and `/botao` → `/trigger` are unchanged. `handleLiveClip`, the `/clip` route, the `liveClip*` consts and the page's clip UI were all removed. |
+| 7 | R2 push deferred to phase 2 | do it now | direct-from-laptop was capped by the 1.3 Mbit/s uplink |
+| 7b | R2 push **superseded** by a Cloudflare Cache Rule (phase 1.5) | build the R2 sync now | wired uplink (~56 Mbit/s) + edge-cached `.ts`/`.m3u8` covers hundreds of viewers with **no code and no cost**; R2 only becomes worth it past that, or if Cloudflare flags the video volume under ToS 2.8 |
+| 8 | Cache `.m3u8` for 1 s via a Cloudflare Edge-TTL override, not a Go header change | set `Cache-Control: max-age=1` in `liveHandler` | the dashboard override wins over `no-cache`; keeps the origin header correct for any direct-from-origin use and keeps the change out of the binary |
 
-## Known limit (phase 1)
+## Capacity (phase 1 + 1.5)
 
-Direct-from-laptop serving supports **~1 simultaneous viewer** (both substreams
-≈ 1 Mbit/s per viewer vs 1.3 Mbit/s uplink). Enough for "the operator OR the
-venue owner watching". Phase 2 (many end users) = sync the live dir to R2, point
-the page at the CDN; the uplink then carries exactly one copy regardless of
-viewer count.
+Direct-from-laptop (phase 1, no edge cache): each viewer pulls both substreams
+≈ **1 Mbit/s**; against the wired uplink (~56 Mbit/s, re-measured 2026-09-05,
+was 1.3 Mbit/s on WiFi) and leaving headroom for clip uploads that is
+**~15–25 simultaneous viewers**. The old "~1 viewer" figure was the WiFi era.
+
+Phase 1.5 — **Cloudflare Cache Rule** on `aovivo.vianasociety.com.br/live/*`:
+
+- `*.ts` → *Eligible for cache*, Edge TTL **override 60 s** (segment names are
+  timestamped and never rewritten — immutable).
+- `*.m3u8` → *Eligible for cache*, Edge TTL **override 1 s** (overrides the
+  origin `no-cache`; 1 s stale playlist is nothing against ~15–20 s HLS
+  latency).
+
+Origin load then flattens to **~5 Mbit/s** (one pull per Cloudflare PoP per
+segment, ~3–5 PoPs in Brazil) regardless of whether 50 or 500 people are
+watching. `aovivo.*` is already proxied through the edge (created by
+`cloudflared tunnel route dns`), so Cache Rules apply to tunnel traffic. No code
+change.
+
+**ToS caveat:** a few hundred substream viewers ≈ 100–300 Mbit/s of video out of
+Cloudflare's cache on a Free plan can draw a ToS 2.8 enforcement email (a
+request to move to Cloudflare Stream or R2 — not a bill). If that happens, phase
+2 (R2, free egress) is the sanctioned path.
+
+Replay generation still stays on the one field laptop (one ffmpeg, press-queue
+cap 1) — unchanged by any of this.
 
 ## Phase 2 sketch (not implemented)
 
