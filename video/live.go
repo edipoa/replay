@@ -43,15 +43,46 @@ func (e *Engine) runLiveHLS(ctx context.Context) {
 			return
 		}
 
+		// The replay-site schedule (slots + games + manual override) decides
+		// when the stream is allowed on. Block here while it is off; a nil gate
+		// means "always on" (tests / no backend configured).
+		if e.cfg.LiveGate != nil {
+			if !e.cfg.LiveGate.IsOn() {
+				log.Info("live parada — fora de horário; aguardando a agenda liberar")
+				obs.Event(obs.Info, "live.paused", e.cfg.CameraID,
+					"transmissão ao vivo pausada — fora de horário de jogo")
+			}
+			if !e.cfg.LiveGate.WaitOn(ctx) {
+				return
+			}
+			backoff = reconnectBaseDelay // entering via the gate is not a failure
+		}
+
+		// runCtx dies when the parent ctx dies OR the gate goes off — the
+		// latter sends SIGTERM to FFmpeg via runFFmpegLiveHLS's CommandContext.
+		runCtx, cancelRun := context.WithCancel(ctx)
+		if e.cfg.LiveGate != nil {
+			go func() { e.cfg.LiveGate.WaitOff(runCtx); cancelRun() }()
+		}
+
 		attempt++
 		log.Info("starting live FFmpeg", slog.Int("attempt", attempt))
 		obs.Event(obs.Info, "live.started", e.cfg.CameraID, "iniciando FFmpeg da transmissão ao vivo",
 			slog.Int("attempt", attempt))
 
-		err := e.runFFmpegLiveHLS(ctx, liveDir)
+		err := e.runFFmpegLiveHLS(runCtx, liveDir)
+		cancelRun()
 
 		if ctx.Err() != nil {
 			return
+		}
+
+		// FFmpeg was killed because the gate turned off, not because it failed —
+		// loop back to WaitOn without logging an error or backing off.
+		if e.cfg.LiveGate != nil && !e.cfg.LiveGate.IsOn() {
+			obs.Event(obs.Info, "live.stopped", e.cfg.CameraID,
+				"transmissão ao vivo encerrada — fim do horário de jogo")
+			continue
 		}
 
 		if err != nil {

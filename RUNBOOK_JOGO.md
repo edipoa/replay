@@ -261,15 +261,19 @@ página `/botao` só pede e repassa).
 
 **Transmissão ao vivo** (`aovivo.vianasociety.com.br`): mostra as câmeras ao
 vivo no navegador (HLS, ~5-20s de atraso). Design completo em
-`docs/design-live-stream.md`. Passos pra ligar:
+`docs/design-live-stream.md` e `docs/design-live-schedule.md` (liga/desliga por
+agenda). Passos pra ligar:
 
 ```bash
 # 1. tmpfs pros segmentos da live (o HD não aguenta a rotação)
 echo 'tmpfs /tmp/replay_live tmpfs noatime,size=128M,mode=1777 0 0' | sudo tee -a /etc/fstab
 sudo mkdir -p /tmp/replay_live && sudo mount -a
 
-# 2. .env
-REPLAY_LIVE_ENABLED=true
+# 2. .env — a live sobe se houver substream + backend configurado.
+#    NÃO existe mais REPLAY_LIVE_ENABLED.
+REPLAY_BACKEND_URL=https://api.vianasociety.com.br
+REPLAY_BACKEND_API_KEY=<mesma do site>
+# REPLAY_LIVE_POLL_INTERVAL_S=30   (opcional)
 
 # 3. rota + ingress no cloudflared (igual ao botao), ANTES do catch-all:
 cloudflared tunnel route dns <nome-ou-id-do-tunnel> aovivo.vianasociety.com.br
@@ -280,6 +284,13 @@ sudo systemctl restart cloudflared
 # 4. reiniciar o agente
 sudo systemctl restart replay-agent
 ```
+
+**Liga/desliga é automático:** o agent faz poll de `GET /api/live/state` no site
+a cada 30s e sobe/derruba o FFmpeg conforme os slots do dia (`/admin/slots`) +
+jogos avulsos, com 15min de margem antes do primeiro e 1h depois do último.
+Fora de horário a página mostra "Transmissão fora do ar" + o próximo horário.
+Controle manual em **`/admin` → Transmissão**: `Automático` / `Forçar ligado` /
+`Forçar desligado`. Se o site cair, o agent mantém o último estado conhecido.
 
 A live usa o **substream** da câmera (`subtype=1`) pra caber no uplink — a
 qualidade cheia (`subtype=0`) segue só nos clipes. A página é **somente
@@ -297,6 +308,11 @@ mudar código:
   ends_with(http.request.uri.path, ".ts")` → *Eligible for cache*, Edge TTL
   **override 60s**;
 - mesma coisa pra `.m3u8` → Edge TTL **override 1s**.
+
+⚠️ O `/live/*` acima casa também com `/live/state.json` (o estado da agenda que
+a página consulta). Adicione uma regra ANTES dessas pra `ends_with(...,
+"state.json")` → *Bypass cache* (ou Edge TTL 1s), senão a página demora a
+perceber que a live ligou/desligou.
 
 Isso trava a banda da origem em ~5 Mbit/s independente do nº de espectadores.
 Confirme com `curl -sI` que os `.ts`/`.m3u8` voltam `cf-cache-status: HIT` no

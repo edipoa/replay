@@ -8,6 +8,9 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/edipo/replay-saas/internal/live"
 )
 
 // liveHandler serves the rolling HLS files written by the video package under
@@ -56,9 +59,54 @@ func (r *Recorder) liveCameras() []string {
 
 func (r *Recorder) handleLivePage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Outside the scheduled window the stream is down on purpose — show an
+	// "off air" screen with the next slot instead of a broken player.
+	if r.cfg.LiveGate != nil && !r.cfg.LiveGate.IsOn() {
+		if err := liveOffTmpl.Execute(w, liveOffData{Next: nextWindowText(r.cfg.LiveGate.Snapshot())}); err != nil {
+			slog.Warn("obs: render live off page failed", slog.Any("error", err))
+		}
+		return
+	}
+
 	if err := liveTmpl.Execute(w, r.liveCameras()); err != nil {
 		slog.Warn("obs: render live page failed", slog.Any("error", err))
 	}
+}
+
+func (r *Recorder) handleLiveState(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, r.cfg.LiveGate.Snapshot())
+}
+
+type liveOffData struct {
+	Next string // e.g. "Volta sábado às 14:00" — empty if nothing is scheduled
+}
+
+var ptWeekdays = [...]string{"domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"}
+
+// nextWindowText renders State.NextWindowStart as "Volta <dia> às <HH:MM>".
+func nextWindowText(s live.State) string {
+	if s.NextWindowStart == nil {
+		return ""
+	}
+	t := s.NextWindowStart.Local()
+	now := time.Now()
+	day := ptWeekdays[t.Weekday()]
+	switch {
+	case sameDay(t, now):
+		day = "hoje"
+	case sameDay(t, now.AddDate(0, 0, 1)):
+		day = "amanhã"
+	}
+	return "Volta " + day + " às " + t.Format("15:04")
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // liveTmpl is the whole aovivo.* page. hls.js and the display font are fetched
@@ -594,4 +642,55 @@ if (qp.get('selftest') === '1') {
  <div class="ftr-sub">camposocietyviana <span class="gold">·</span> <span id="yr"></span></div>
 </footer>
 <script>var y=document.getElementById('yr');if(y)y.textContent=new Date().getFullYear();</script>
+<script>
+// Auto-recovery: when the schedule turns the stream off, reload so the viewer
+// lands on the "fora do ar" screen instead of a stalled player.
+setInterval(function(){
+  fetch('/live/state.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
+    if(!s.on){location.reload()}
+  }).catch(function(){});
+},20000);
+</script>
+</body></html>`))
+
+// liveOffTmpl is the "fora do ar" screen shown while the schedule gate is off.
+// Self-contained (own palette) so it never depends on liveTmpl's CSS. Its poll
+// loop reloads the page as soon as the stream is allowed back on.
+var liveOffTmpl = template.Must(template.New("liveOff").Parse(`<!doctype html><html lang="pt-BR"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Transmissão fora do ar · Campo Society Viana</title>
+<style>
+ :root{--navy:#0E2A5E;--navy-deep:#07153A;--gold:#E8B842;--paper:#F7F4ED;--muted:rgba(247,244,237,.6)}
+ *{box-sizing:border-box}
+ body{margin:0;min-height:100dvh;display:flex;flex-direction:column;
+  background:var(--navy-deep);color:var(--paper);
+  font:14px/1.6 "JetBrains Mono",ui-monospace,monospace;letter-spacing:.04em}
+ header{display:flex;align-items:center;gap:.6rem;height:3.2rem;padding:0 1rem;
+  background:var(--navy);border-bottom:4px solid var(--gold)}
+ .wordmark{font-weight:800;letter-spacing:.02em;text-transform:uppercase}
+ .wordmark .accent{color:var(--gold)}
+ main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1rem;padding:2rem 1.5rem;text-align:center}
+ .dot{width:.7rem;height:.7rem;border-radius:50%;background:var(--muted)}
+ h1{margin:0;font-family:"Archivo Black","Archivo",sans-serif;font-weight:400;
+  font-size:clamp(1.3rem,5vw,2rem);text-transform:uppercase;letter-spacing:.02em}
+ p{margin:0;max-width:26rem;color:var(--muted)}
+ .next{color:var(--gold);font-weight:700}
+ footer{padding:1.5rem;text-align:center;color:var(--muted);font-size:12px}
+ footer .gold{color:var(--gold)}
+</style></head><body>
+<header><span class="wordmark">CAMPO SOCIETY<span class="accent">·</span>VIANA</span></header>
+<main>
+ <span class="dot" aria-hidden="true"></span>
+ <h1>Transmissão fora do ar</h1>
+ <p>A câmera ao vivo funciona apenas nos horários de jogo.{{if .Next}} <span class="next">{{.Next}}</span>.{{end}}</p>
+</main>
+<footer>Campo Society Viana <span class="gold">·</span> CHAPECÓ <span class="gold">/</span> SC</footer>
+<script>
+setInterval(function(){
+  fetch('/live/state.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
+    if(s.on){location.reload()}
+  }).catch(function(){});
+},20000);
+</script>
 </body></html>`))
