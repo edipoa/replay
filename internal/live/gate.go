@@ -22,7 +22,12 @@ type State struct {
 	Reason          string     `json:"reason"` // slot | forced_on | forced_off | idle
 	WindowStart     *time.Time `json:"window_start"`
 	WindowEnd       *time.Time `json:"window_end"`
+	WindowEndLabel  string     `json:"window_end_label"`
 	NextWindowStart *time.Time `json:"next_window_start"`
+	// NextWindowLabel is preformatted by the backend in the venue timezone
+	// ("hoje às 18:30", "sábado às 14:00"). The agent laptop runs in UTC, so it
+	// must never re-derive this from NextWindowStart.
+	NextWindowLabel string `json:"next_window_label"`
 }
 
 // Gate is a single shared on/off latch (the live stream is all-cameras-or-none).

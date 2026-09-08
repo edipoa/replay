@@ -8,9 +8,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"time"
-
-	"github.com/edipo/replay-saas/internal/live"
 )
 
 // liveHandler serves the rolling HLS files written by the video package under
@@ -63,7 +60,7 @@ func (r *Recorder) handleLivePage(w http.ResponseWriter, _ *http.Request) {
 	// Outside the scheduled window the stream is down on purpose — show an
 	// "off air" screen with the next slot instead of a broken player.
 	if r.cfg.LiveGate != nil && !r.cfg.LiveGate.IsOn() {
-		if err := liveOffTmpl.Execute(w, liveOffData{Next: nextWindowText(r.cfg.LiveGate.Snapshot())}); err != nil {
+		if err := liveOffTmpl.Execute(w, liveOffData{Next: r.cfg.LiveGate.Snapshot().NextWindowLabel}); err != nil {
 			slog.Warn("obs: render live off page failed", slog.Any("error", err))
 		}
 		return
@@ -81,32 +78,7 @@ func (r *Recorder) handleLiveState(w http.ResponseWriter, _ *http.Request) {
 }
 
 type liveOffData struct {
-	Next string // e.g. "Volta sábado às 14:00" — empty if nothing is scheduled
-}
-
-var ptWeekdays = [...]string{"domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"}
-
-// nextWindowText renders State.NextWindowStart as "Volta <dia> às <HH:MM>".
-func nextWindowText(s live.State) string {
-	if s.NextWindowStart == nil {
-		return ""
-	}
-	t := s.NextWindowStart.Local()
-	now := time.Now()
-	day := ptWeekdays[t.Weekday()]
-	switch {
-	case sameDay(t, now):
-		day = "hoje"
-	case sameDay(t, now.AddDate(0, 0, 1)):
-		day = "amanhã"
-	}
-	return "Volta " + day + " às " + t.Format("15:04")
-}
-
-func sameDay(a, b time.Time) bool {
-	ay, am, ad := a.Date()
-	by, bm, bd := b.Date()
-	return ay == by && am == bm && ad == bd
+	Next string // backend-formatted, venue tz: "hoje às 18:30" — empty if none
 }
 
 // liveTmpl is the whole aovivo.* page. hls.js and the display font are fetched
@@ -683,7 +655,7 @@ var liveOffTmpl = template.Must(template.New("liveOff").Parse(`<!doctype html><h
 <main>
  <span class="dot" aria-hidden="true"></span>
  <h1>Transmissão fora do ar</h1>
- <p>A câmera ao vivo funciona apenas nos horários de jogo.{{if .Next}} <span class="next">{{.Next}}</span>.{{end}}</p>
+ <p>A câmera ao vivo funciona apenas nos horários de jogo.{{if .Next}} <span class="next">Volta {{.Next}}</span>.{{end}}</p>
 </main>
 <footer>Campo Society Viana <span class="gold">·</span> CHAPECÓ <span class="gold">/</span> SC</footer>
 <script>

@@ -127,7 +127,9 @@ Payload de `/api/live/state`:
   "reason": "slot",
   "window_start": "2026-09-07T17:45:00-03:00",
   "window_end":   "2026-09-07T23:00:00-03:00",
-  "next_window_start": "2026-09-08T18:45:00-03:00"
+  "window_end_label":  "hoje às 23:00",
+  "next_window_start": "2026-09-08T18:45:00-03:00",
+  "next_window_label": "amanhã às 18:30"
 }
 ```
 
@@ -135,6 +137,11 @@ Payload de `/api/live/state`:
 `next_window_start` = próximo início (slot recorrente **ou** `games`) nos
 próximos 7 dias, já com a margem de 15 min. `reason ∈ {slot, forced_on,
 forced_off, idle}`.
+
+⚠️ Os `*_label` são pré-formatados pelo backend no fuso do campo (pt-BR:
+"hoje às 18:30", "sábado às 14:00"). **O agent e a página `aovivo` DEVEM usar o
+label** — o notebook do campo roda em `TZ=UTC`, então re-derivar a hora do
+`*_start` mostra +3h (bug de 2026-09-08, corrigido).
 
 ### 2. Backend — cálculo da janela
 
@@ -237,7 +244,7 @@ Check: `internal/live/gate_test.go` — `WaitOn` bloqueia e libera no
 Endpoint novo `GET /live/state.json` (no `mux` junto do `/live/`):
 
 ```json
-{ "on": false, "reason": "idle", "next_window_start": "2026-09-08T18:45:00-03:00" }
+{ "on": false, "reason": "idle", "next_window_label": "amanhã às 18:30" }
 ```
 
 De `gate.Snapshot()`. `Access-Control-Allow-Origin: *`, `Cache-Control:
