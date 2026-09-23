@@ -54,6 +54,11 @@ func (r *Recorder) liveCameras() []string {
 	return cams
 }
 
+type liveData struct {
+	Cams     []string
+	Sponsors []sponsor
+}
+
 func (r *Recorder) handleLivePage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
@@ -66,7 +71,7 @@ func (r *Recorder) handleLivePage(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	if err := liveTmpl.Execute(w, r.liveCameras()); err != nil {
+	if err := liveTmpl.Execute(w, liveData{Cams: r.liveCameras(), Sponsors: r.sponsorList()}); err != nil {
 		slog.Warn("obs: render live page failed", slog.Any("error", err))
 	}
 }
@@ -97,14 +102,16 @@ type liveOffData struct {
 // Seam calibration — the two cameras see the midfield from different angles,
 // so the join is tuned by hand, live, via URL knobs (bookmark the tuned link,
 // then bake the values as the :root defaults, no redeploy needed to try one):
-//   ?seam=<n>    trim n% off BOTH inner edges (shorthand for seaml+seamr)
-//   ?seaml=<n>   trim n% off the left feed's inner (right) edge
-//   ?seamr=<n>   trim n% off the right feed's inner (left) edge
-//   ?dxl/?dxr=<px>   shift a feed horizontally (negative = left)
-//   ?dyl/?dyr=<px>   shift a feed vertically (negative = up)
-//   ?rotl/?rotr=<deg>  roll a feed (the cameras are not perfectly level)
-//   ?blend=<px>  cross-fade width at the join — the feeds overlap by <px> and
-//                the right one's edge fades in, so there is no hard cut
+//
+//	?seam=<n>    trim n% off BOTH inner edges (shorthand for seaml+seamr)
+//	?seaml=<n>   trim n% off the left feed's inner (right) edge
+//	?seamr=<n>   trim n% off the right feed's inner (left) edge
+//	?dxl/?dxr=<px>   shift a feed horizontally (negative = left)
+//	?dyl/?dyr=<px>   shift a feed vertically (negative = up)
+//	?rotl/?rotr=<deg>  roll a feed (the cameras are not perfectly level)
+//	?blend=<px>  cross-fade width at the join — the feeds overlap by <px> and
+//	             the right one's edge fades in, so there is no hard cut
+//
 // ?cal=1 opens calibration mode: sliders for trim + blend, DRAG a feed to
 // move it, SHIFT-drag to roll it, "ver cru" to zero everything and see the raw
 // feeds, and a live ?query readout — copy it, paste the values into :root.
@@ -121,9 +128,7 @@ type liveOffData struct {
 // (video + the sponsor bar; header and footer hidden) and, where the browser
 // allows it, enters real fullscreen and locks to landscape; iOS Safari gets
 // the CSS overlay alone.
-var liveTmpl = template.Must(template.New("live").
-	Funcs(template.FuncMap{"sponsors": func() []sponsor { return sponsors }}).
-	Parse(`<!doctype html>
+var liveTmpl = template.Must(template.New("live").Parse(`<!doctype html>
 <html lang="pt-br"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -321,19 +326,19 @@ var liveTmpl = template.Must(template.New("live").
   font:12px/1.7 "JetBrains Mono",ui-monospace,monospace;letter-spacing:.08em}
  .ftr .gold{color:var(--gold)}
  .ftr-sub{opacity:.6;margin-top:.5rem}
-</style></head><body class="{{if sponsors}}has-sp{{end}}">
+</style></head><body class="{{if .Sponsors}}has-sp{{end}}">
 <header>
  <span class="wordmark">CAMPO SOCIETY<span class="accent">·</span>VIANA</span>
  <span class="sub">Transmissão ao vivo</span>
  <span class="spacer"></span>
  <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>Ao vivo</span>
-{{if .}} <button class="fs-btn" type="button" aria-label="Tela cheia" aria-pressed="false">
+{{if .Cams}} <button class="fs-btn" type="button" aria-label="Tela cheia" aria-pressed="false">
   <svg class="i-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M8 21H5a2 2 0 0 1-2-2v-3"/></svg>
   <svg class="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
  </button>{{end}}
 </header>
-{{if .}}
-{{if eq (len .) 2}}
+{{if .Cams}}
+{{if eq (len .Cams) 2}}
 <div class="rotate">
  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
   <path d="M4.4 11.5a7.6 7.6 0 0 0 3.4 6.4"/>
@@ -348,24 +353,24 @@ var liveTmpl = template.Must(template.New("live").
  <span class="pg-disc"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></span>
  <span class="pg-label">Assistir</span>
 </button>
-{{range .}} <figure id="f-{{.}}"><video id="v-{{.}}" autoplay muted playsinline></video><figcaption>{{.}}</figcaption></figure>
+{{range .Cams}} <figure id="f-{{.}}"><video id="v-{{.}}" autoplay muted playsinline></video><figcaption>{{.}}</figcaption></figure>
 {{end}}</div>
 {{else}}
 <div class="grid">
-{{range .}} <figure><video id="v-{{.}}" controls autoplay muted playsinline></video><figcaption>{{.}}</figcaption></figure>
+{{range .Cams}} <figure><video id="v-{{.}}" controls autoplay muted playsinline></video><figcaption>{{.}}</figcaption></figure>
 {{end}}</div>
 {{end}}
-{{if sponsors}}
+{{if .Sponsors}}
 <aside class="sponsors">
  <span class="sp-label">Patrocínio</span>
  <div class="sp-logos">
-{{range sponsors}} {{if .URL}}<a class="sp{{if .Plate}} plate{{end}}" href="{{.URL}}" target="_blank" rel="noopener"><img src="{{.Img}}" alt="{{.Name}}" loading="lazy"></a>{{else}}<span class="sp{{if .Plate}} plate{{end}}"><img src="{{.Img}}" alt="{{.Name}}" loading="lazy"></span>{{end}}
+{{range .Sponsors}} <span class="sp plate"><img src="{{.Img}}" alt="{{.Name}}" loading="lazy"></span>
 {{end}} </div>
 </aside>
 {{end}}
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 <script>
-var cams = [{{range $i, $c := .}}{{if $i}},{{end}}"{{$c}}"{{end}}];
+var cams = [{{range $i, $c := .Cams}}{{if $i}},{{end}}"{{$c}}"{{end}}];
 var qp = new URLSearchParams(location.search);
 
 // seam calibration knobs — number => append unit, otherwise pass the raw

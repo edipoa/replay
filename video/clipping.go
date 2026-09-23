@@ -15,6 +15,18 @@ import (
 	"github.com/edipo/replay-saas/internal/obs"
 )
 
+// Overlay geometry for exported clips, hardcoded rather than per-venue config.
+const (
+	sponsorBoxW     = 140 // fixed box each sponsor logo is fitted into, px
+	sponsorBoxH     = 60
+	sponsorGap      = 24 // horizontal gap between sponsor boxes, px
+	footerHeight    = 80 // white footer bar height, px
+	watermarkHeight = 44 // watermark is a wide thin pill (~15:1): fix height, auto width
+)
+
+// Compile-time guard: fails to build if footerHeight < sponsorBoxH.
+const _ = uint(footerHeight - sponsorBoxH)
+
 // ─── Clipping Engine ──────────────────────────────────────────────────────────
 
 // GenerateReplay builds a replay clip centred on triggerTime.
@@ -205,6 +217,59 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// buildOverlayArgs returns the ffmpeg args — beyond the base video already at
+// input 0 — that composite the watermark, arena logo and sponsor footer onto
+// the scaled clip. Inputs are numbered [0] video, watermark, logo, then each
+// sponsor in display order. Stages are chained through a running label
+// (cur0, cur1, …). Corner overlays run on the unpadded frame; the footer is
+// padded below the video afterwards, so it never covers the picture. Falls
+// back to a plain "-vf" when there is nothing to composite.
+func buildOverlayArgs(clipWidth int, watermarkPath, logoPath string, sponsorPaths []string, hasWatermark, hasLogo bool) []string {
+	sc := fmt.Sprintf("scale=%d:-2", clipWidth)
+	if !hasWatermark && !hasLogo && len(sponsorPaths) == 0 {
+		return []string{"-vf", sc}
+	}
+
+	var args []string
+	var fc strings.Builder
+	in := 1 // next input index; input 0 is the base video, added by the caller
+	n := 0  // current stage: label is cur<n>
+	fmt.Fprintf(&fc, "[0:v]%s[cur0]", sc)
+
+	stage := func(chain, overlay string) {
+		fmt.Fprintf(&fc, ";[%d:v]%s[ov%d];[cur%d][ov%d]overlay=%s[cur%d]", in, chain, in, n, in, overlay, n+1)
+		in++
+		n++
+	}
+
+	if hasWatermark {
+		args = append(args, "-i", watermarkPath)
+		stage(fmt.Sprintf("scale=-1:%d", watermarkHeight), "10:H-h-10")
+	}
+	if hasLogo {
+		args = append(args, "-i", logoPath)
+		stage("scale=80:-1", "W-w-10:H-h-10")
+	}
+	if len(sponsorPaths) > 0 {
+		fmt.Fprintf(&fc, ";[cur%d]pad=iw:ih+%d:0:0:white[cur%d]", n, footerHeight, n+1)
+		n++
+
+		totalW := len(sponsorPaths)*sponsorBoxW + (len(sponsorPaths)-1)*sponsorGap
+		x := max(10, (clipWidth-totalW)/2)
+		margin := (footerHeight - sponsorBoxH) / 2
+		fit := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+			sponsorBoxW, sponsorBoxH, sponsorBoxW, sponsorBoxH)
+		for _, p := range sponsorPaths {
+			args = append(args, "-i", p)
+			stage(fit, fmt.Sprintf("%d:H-h-%d", x, margin))
+			x += sponsorBoxW + sponsorGap
+		}
+	}
+
+	fmt.Fprintf(&fc, ";[cur%d]copy[outv]", n)
+	return append(args, "-filter_complex", fc.String(), "-map", "[outv]", "-map", "0:a?")
+}
+
 // writeConcatFile writes an FFmpeg concat demuxer input file.
 //
 // Format:
@@ -272,6 +337,8 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	hasLogo := fileExists(e.cfg.LogoPath)
 	hasMusic := e.cfg.BackgroundMusicPath != "" && fileExists(e.cfg.BackgroundMusicPath)
 
+	sponsorPaths := obs.SponsorFiles(e.cfg.SponsorDir)
+
 	// When music is requested, pass 2 encodes to a temp file; pass 3 muxes the
 	// music in. This avoids filter-graph buffer overflows that occur when a
 	// stream_loop audio input races against corrupt video frames.
@@ -297,43 +364,23 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 
 	if hasWatermark {
 		e.logger.Info("applying watermark", slog.String("path", e.cfg.WatermarkPath))
-		pass2 = append(pass2, "-i", e.cfg.WatermarkPath)
 	} else {
 		e.logger.Warn("watermark not found, skipping", slog.String("path", e.cfg.WatermarkPath))
 	}
 	if hasLogo {
 		e.logger.Info("applying arena logo", slog.String("path", e.cfg.LogoPath))
-		pass2 = append(pass2, "-i", e.cfg.LogoPath)
 	} else {
 		e.logger.Warn("arena logo not found, skipping", slog.String("path", e.cfg.LogoPath))
+	}
+	if len(sponsorPaths) > 0 {
+		e.logger.Info("applying sponsor footer", slog.Int("count", len(sponsorPaths)))
 	}
 
 	// Build the video portion of the filter graph.
 	// watermark → bottom-left  (10:H-h-10)
 	// logo      → bottom-right (W-w-10:H-h-10)
-	sc := fmt.Sprintf("scale=%d:-2", e.cfg.ClipWidth)
-	switch {
-	case hasWatermark && hasLogo:
-		pass2 = append(pass2,
-			"-filter_complex", "[0:v]"+sc+"[sc];[2:v]scale=80:-1[logo];[sc][1:v]overlay=10:H-h-10[wm];[wm][logo]overlay=W-w-10:H-h-10[outv]",
-			"-map", "[outv]",
-			"-map", "0:a?",
-		)
-	case hasWatermark:
-		pass2 = append(pass2,
-			"-filter_complex", "[0:v]"+sc+"[sc];[sc][1:v]overlay=10:H-h-10[outv]",
-			"-map", "[outv]",
-			"-map", "0:a?",
-		)
-	case hasLogo:
-		pass2 = append(pass2,
-			"-filter_complex", "[0:v]"+sc+"[sc];[1:v]scale=80:-1[logo];[sc][logo]overlay=W-w-10:H-h-10[outv]",
-			"-map", "[outv]",
-			"-map", "0:a?",
-		)
-	default:
-		pass2 = append(pass2, "-vf", sc)
-	}
+	// sponsors  → centered row in a white footer bar padded below the video
+	pass2 = append(pass2, buildOverlayArgs(e.cfg.ClipWidth, e.cfg.WatermarkPath, e.cfg.LogoPath, sponsorPaths, hasWatermark, hasLogo)...)
 
 	pass2 = append(pass2,
 		"-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",

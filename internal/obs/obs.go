@@ -66,6 +66,10 @@ type Config struct {
 	// Empty disables both.
 	LiveDir string
 
+	// SponsorDir is the folder of sponsor logos shown under the live video
+	// (served at /sponsors/<file>). Empty or missing = no sponsor strip.
+	SponsorDir string
+
 	// LiveGate is the schedule on/off latch. When set, /live/state.json reports
 	// it and the aovivo page shows a "fora do ar" screen while it is off.
 	LiveGate *live.Gate

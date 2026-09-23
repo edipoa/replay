@@ -28,6 +28,7 @@ dist-linux: _check-ffmpeg-linux
 	cp $(TOOLS)/ffmpeg-linux          $(DIST)/linux/ffmpeg
 	cp faz-o-clip-watermark-220.png   $(DIST)/linux/watermark.png
 	cp logo.png                       $(DIST)/linux/logo.png
+	rm -rf $(DIST)/linux/sponsors && mkdir -p $(DIST)/linux/sponsors && cp -r sponsors/. $(DIST)/linux/sponsors/
 	cp agenda.json                    $(DIST)/linux/agenda.json
 	cp .env.example                   $(DIST)/linux/.env
 	cp start.sh                       $(DIST)/linux/start.sh
@@ -48,6 +49,7 @@ dist-windows: _check-ffmpeg-windows
 	GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o $(DIST)/windows/$(BINARY).exe .
 	cp $(TOOLS)/ffmpeg-windows.exe    $(DIST)/windows/ffmpeg.exe
 	cp faz-o-clip-watermark-220.png   $(DIST)/windows/watermark.png
+	rm -rf $(DIST)/windows/sponsors && mkdir -p $(DIST)/windows/sponsors && cp -r sponsors/. $(DIST)/windows/sponsors/
 	cp agenda.json                    $(DIST)/windows/agenda.json
 	cp .env.example                   $(DIST)/windows/.env
 	cp start.bat                      $(DIST)/windows/start.bat
@@ -72,6 +74,7 @@ deploy:
 	@echo "→ sincronizando dist/linux/ com $(DEPLOY_USER)@$(HOST):$(REMOTE_PATH) (preservando .env remoto)"
 	ssh $(DEPLOY_USER)@$(HOST) "mkdir -p $(REMOTE_PATH)"
 	rsync -a --exclude='.env' $(DIST)/linux/ $(DEPLOY_USER)@$(HOST):$(REMOTE_PATH)/
+	rsync -a --delete $(DIST)/linux/sponsors/ $(DEPLOY_USER)@$(HOST):$(REMOTE_PATH)/sponsors/
 	ssh $(DEPLOY_USER)@$(HOST) "sudo systemctl restart replay-agent"
 	@echo "✅  Deploy concluído — replay-agent reiniciado em $(HOST)"
 

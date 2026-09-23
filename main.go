@@ -51,6 +51,7 @@ type appConfig struct {
 	TelegramLogPath     string
 	WatermarkPath       string
 	LogoPath            string
+	SponsorDir          string
 	BackgroundMusicPath string
 
 	// Hardware
@@ -83,6 +84,7 @@ func loadConfig() (appConfig, error) {
 		TelegramLogPath:     envutil.Or("REPLAY_TELEGRAM_LOG", "/tmp/telegram.log"),
 		WatermarkPath:       envutil.Or("REPLAY_WATERMARK_PATH", "watermark.png"),
 		LogoPath:            envutil.Or("REPLAY_LOGO_PATH", "logo.png"),
+		SponsorDir:          envutil.Or("REPLAY_SPONSORS_DIR", "sponsors"),
 		BackgroundMusicPath: os.Getenv("REPLAY_MUSIC_PATH"),
 		JoystickID:          envutil.IntOr("REPLAY_JOYSTICK_ID", 0),
 		DebounceMs:          envutil.IntOr("REPLAY_DEBOUNCE_MS", 2000),
@@ -216,6 +218,7 @@ func run(logger *slog.Logger) error {
 			FFmpegBin:           ffmpegBin,
 			WatermarkPath:       cfg.WatermarkPath,
 			LogoPath:            cfg.LogoPath,
+			SponsorDir:          cfg.SponsorDir,
 			BackgroundMusicPath: cfg.BackgroundMusicPath,
 			CameraID:            cam.ID,
 			LiveDir:             cfg.LiveDir,
@@ -297,6 +300,7 @@ func run(logger *slog.Logger) error {
 	}
 	if liveGate != nil {
 		obsCfg.LiveDir = cfg.LiveDir
+		obsCfg.SponsorDir = cfg.SponsorDir
 		obsCfg.LiveGate = liveGate
 	}
 	if bot != nil {

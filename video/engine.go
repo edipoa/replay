@@ -79,6 +79,11 @@ type Config struct {
 	// Default: "logo.png" (relative to the working directory).
 	LogoPath string
 
+	// SponsorDir is a folder of sponsor logos (png/jpg/webp/gif, any aspect
+	// ratio) shown in a white footer below the video, ordered by file name.
+	// Empty or missing folder = no footer. Default: "sponsors".
+	SponsorDir string
+
 	// BackgroundMusicPath is the path to an audio file (MP3, AAC, …) looped as
 	// low-volume background music in every clip. Silently skipped when empty or
 	// absent. Default: "" (disabled).
@@ -141,6 +146,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.WatermarkPath == "" {
 		c.WatermarkPath = "watermark.png"
+	}
+	if c.SponsorDir == "" {
+		c.SponsorDir = "sponsors"
 	}
 	if c.LogoPath == "" {
 		c.LogoPath = "logo.png"

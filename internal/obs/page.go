@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"fmt"
 	"html/template"
 	"strconv"
 )
@@ -47,7 +48,19 @@ func problems(s Snapshot) []string {
 // assets, so it works on the venue's flaky connection and while the agent is
 // restarting. The page reloads itself every 10s (paused for 30s after any
 // button press so the result stays readable).
-var indexTmpl = template.Must(template.New("index").Parse(`<!doctype html>
+// fmtUptime renders seconds as "2h 05min" / "12min" / "<1min".
+func fmtUptime(sec int) string {
+	h, m := sec/3600, sec%3600/60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh %02dmin", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dmin", m)
+	}
+	return "<1min"
+}
+
+var indexTmpl = template.Must(template.New("index").Funcs(template.FuncMap{"dur": fmtUptime}).Parse(`<!doctype html>
 <html lang="pt-br"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -147,7 +160,7 @@ var indexTmpl = template.Must(template.New("index").Parse(`<!doctype html>
 
 <h2>agente</h2>
 <div class="grid">
- <div class="card"><span class="label">uptime</span><span class="val">{{.Snapshot.UptimeS}}s</span></div>
+ <div class="card"><span class="label">uptime</span><span class="val">{{dur .Snapshot.UptimeS}}</span></div>
  <div class="card"><span class="label">botão USB</span><span class="val {{if .Snapshot.USBOK}}ok{{else}}bad{{end}}">{{if .Snapshot.USBOK}}ok{{else}}caído{{end}}</span></div>
  <div class="card"><span class="label">clipes hoje</span><span class="val">{{.Snapshot.ClipsToday}}</span></div>
  <div class="card"><span class="label">falhas hoje</span><span class="val {{if .Snapshot.ClipsFailedToday}}bad{{end}}">{{.Snapshot.ClipsFailedToday}}</span></div>
