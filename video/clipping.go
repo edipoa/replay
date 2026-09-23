@@ -20,7 +20,7 @@ const (
 	sponsorBoxW     = 140 // fixed box each sponsor logo is fitted into, px
 	sponsorBoxH     = 60
 	sponsorGap      = 24 // horizontal gap between sponsor boxes, px
-	footerHeight    = 80 // white footer bar height, px
+	footerHeight    = 80 // footer bar height, px
 	watermarkHeight = 44 // watermark is a wide thin pill (~15:1): fix height, auto width
 )
 
@@ -251,7 +251,9 @@ func buildOverlayArgs(clipWidth int, watermarkPath, logoPath string, sponsorPath
 		stage("scale=80:-1", "W-w-10:H-h-10")
 	}
 	if len(sponsorPaths) > 0 {
-		fmt.Fprintf(&fc, ";[cur%d]pad=iw:ih+%d:0:0:white[cur%d]", n, footerHeight, n+1)
+		// Navy, not white: a white footer swallows sponsor logos that are
+		// themselves white/light (common for logos meant for dark backgrounds).
+		fmt.Fprintf(&fc, ";[cur%d]pad=iw:ih+%d:0:0:0x0E2A5E[cur%d]", n, footerHeight, n+1)
 		n++
 
 		totalW := len(sponsorPaths)*sponsorBoxW + (len(sponsorPaths)-1)*sponsorGap
@@ -379,7 +381,7 @@ func (e *Engine) runFFmpegConcat(ctx context.Context, concatPath, outputPath str
 	// Build the video portion of the filter graph.
 	// watermark → bottom-left  (10:H-h-10)
 	// logo      → bottom-right (W-w-10:H-h-10)
-	// sponsors  → centered row in a white footer bar padded below the video
+	// sponsors  → centered row in a navy footer bar padded below the video
 	pass2 = append(pass2, buildOverlayArgs(e.cfg.ClipWidth, e.cfg.WatermarkPath, e.cfg.LogoPath, sponsorPaths, hasWatermark, hasLogo)...)
 
 	pass2 = append(pass2,

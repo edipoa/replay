@@ -80,7 +80,7 @@ type Config struct {
 	LogoPath string
 
 	// SponsorDir is a folder of sponsor logos (png/jpg/webp/gif, any aspect
-	// ratio) shown in a white footer below the video, ordered by file name.
+	// ratio) shown in a navy footer below the video, ordered by file name.
 	// Empty or missing folder = no footer. Default: "sponsors".
 	SponsorDir string
 

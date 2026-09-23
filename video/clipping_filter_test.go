@@ -46,7 +46,7 @@ func TestBuildOverlayArgs(t *testing.T) {
 	// 4 sponsors: totalW = 4*140+3*24 = 632, startX = (1280-632)/2 = 324, step 164.
 	sp := []string{"a.png", "b.png", "c.png", "d.png"}
 	fc := filterOf(t, buildOverlayArgs(1280, "wm.png", "lg.png", sp, true, true))
-	if !strings.Contains(fc, "[cur2]pad=iw:ih+80:0:0:white[cur3]") {
+	if !strings.Contains(fc, "[cur2]pad=iw:ih+80:0:0:0x0E2A5E[cur3]") {
 		t.Errorf("missing footer pad: %s", fc)
 	}
 	const fit = "scale=140:60:force_original_aspect_ratio=decrease,format=rgba,pad=140:60:(ow-iw)/2:(oh-ih)/2:color=black@0.0"

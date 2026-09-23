@@ -315,7 +315,6 @@ var liveTmpl = template.Must(template.New("live").Parse(`<!doctype html>
  .sp{display:inline-flex;align-items:center;height:calc(var(--sp-h) - 2rem);
   padding:.35rem .7rem;border-radius:8px;
   background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)}
- .sp.plate{background:#fff;border-color:transparent;padding:.4rem 1rem}
  .sp img{height:100%;width:auto;display:block}
  a.sp{transition:transform .15s,border-color .15s}
  a.sp:hover{transform:translateY(-2px);border-color:rgba(232,184,66,.4)}
@@ -364,7 +363,7 @@ var liveTmpl = template.Must(template.New("live").Parse(`<!doctype html>
 <aside class="sponsors">
  <span class="sp-label">Patrocínio</span>
  <div class="sp-logos">
-{{range .Sponsors}} <span class="sp plate"><img src="{{.Img}}" alt="{{.Name}}" loading="lazy"></span>
+{{range .Sponsors}} <span class="sp"><img src="{{.Img}}" alt="{{.Name}}" loading="lazy"></span>
 {{end}} </div>
 </aside>
 {{end}}
